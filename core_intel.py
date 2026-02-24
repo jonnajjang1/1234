@@ -3,7 +3,6 @@ import aiohttp
 import time
 import json
 import logging
-import math
 import os
 import random
 from collections import deque
@@ -268,7 +267,9 @@ class MarketIntelligence:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 payload = json.loads(msg.data)
-                                for item in (payload.get('data', []) if isinstance(payload.get('data'), list) else [payload.get('data')]):
+                                raw = payload.get('data')
+                                for item in (raw if isinstance(raw, list) else [raw]):
+                                    if not item: continue
                                     o = item.get('o', {}); sym, side = o.get('s'), o.get('S')
                                     val = float(o.get('q', 0)) * float(o.get('p', 0))
                                     s_type = 'SHORT' if side == 'BUY' else 'LONG'
@@ -286,7 +287,7 @@ class MarketIntelligence:
                 now = time.time(); headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
                 
                 # Priority 1: Active positions (per-symbol 2s cooldown to prevent burst)
-                priority = self.active_position_symbols
+                priority = set(self.active_position_symbols)  # Snapshot to avoid RuntimeError during iteration
                 for sym in priority:
                     if (self.trading_status.get(sym) == 'TRADING'
                             and now > self.symbol_backoffs.get(sym, 0)

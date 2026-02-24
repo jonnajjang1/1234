@@ -33,27 +33,30 @@ class SharkTrader:
 
     async def _db_writer_worker(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        while True:
-            future = None
-            try:
-                task = await self.db_queue.get()
-                if len(task) == 3:
-                    func, args, future = task
-                else:
-                    func, args = task
-                
-                func(conn, *args); conn.commit()
-                if future and not future.done(): future.set_result(True)
-                self.db_queue.task_done()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logging.error(f"❌ [DB_WORKER] Write Failed: {e}")
-                if future and not future.done(): future.set_exception(e)
-                self.db_queue.task_done()
-                await asyncio.sleep(1)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            while True:
+                future = None
+                try:
+                    task = await self.db_queue.get()
+                    if len(task) == 3:
+                        func, args, future = task
+                    else:
+                        func, args = task
+
+                    func(conn, *args); conn.commit()
+                    if future and not future.done(): future.set_result(True)
+                    self.db_queue.task_done()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.error(f"❌ [DB_WORKER] Write Failed: {e}")
+                    if future and not future.done(): future.set_exception(e)
+                    self.db_queue.task_done()
+                    await asyncio.sleep(1)
+        finally:
+            conn.close()
 
     async def _execute_db_task(self, func, *args):
         await self.db_queue.put((func, args))
