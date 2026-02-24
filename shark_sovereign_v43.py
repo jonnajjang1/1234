@@ -1,4 +1,4 @@
-import mmap; import struct; import time; import os; import json; import asyncio; import aiohttp; import logging; import fcntl; import signal; import sys; import re; import sqlite3; import subprocess; import ctypes; import importlib; import heapq; import shutil; import traceback
+import mmap; import time; import os; import json; import asyncio; import aiohttp; import logging; import sys; import re; import subprocess; import ctypes; import heapq; import shutil; import traceback
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
 BASE_DIR = "/home/ninano990707/shark_system"; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
@@ -106,6 +106,8 @@ class SovereignEngine:
                             logging.info("✅ Signal Sent.")
                         else:
                             logging.info("💤 Config matches. No rotation needed.")
+            except asyncio.CancelledError:
+                raise
             except Exception as e: logging.error(f"Discovery Error: {e}")
             await asyncio.sleep(DISCOVERY_INTERVAL)
 
@@ -118,6 +120,8 @@ class SovereignEngine:
                         logging.info(f"🚪 EXIT TRIGGERED: {sym} for {reason}")
                         await self.trader.close_position(sym, price, reason, self.market_data_cache.get(sym))
                 await asyncio.sleep(SCANNER_SLEEP_TICK)
+            except asyncio.CancelledError:
+                raise
             except Exception as e: logging.error(f"Trader Loop Error: {e}")
 
     async def run_scanner_loop(self):
@@ -226,7 +230,7 @@ class SovereignEngine:
                         try:
                             m.oi_z, m.oi_raw, m.rsi5, m.rsi15 = data['oi_z'], data['oi_raw'], r5_calib, r15_calib
                             m.score_short = m.score_long = 0.0  # final scores written in Pass 2 via m_ref
-                        except Exception: pass
+                        except Exception as e: logging.debug(f"SHM writeback failed [{sym}]: {e}")
 
                     except Exception as sym_e:
                         if "struct" not in str(sym_e): logging.error(f"⚠️ Scanner Error ({i}): {sym_e}")
@@ -263,7 +267,7 @@ class SovereignEngine:
                         if side == 'SHORT':  m_ref.score_short, m_ref.score_long = _raw, 0.0
                         elif side == 'LONG': m_ref.score_long,  m_ref.score_short = _raw, 0.0
                         else:                m_ref.score_short = m_ref.score_long = 0.0
-                    except Exception: pass
+                    except Exception as e: logging.debug(f"SHM score write failed [{sym}]: {e}")
 
                     if sig == "SNIPER":
                         if sym not in intel.rsi_state:
@@ -294,11 +298,18 @@ class SovereignEngine:
                 
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 
+            except asyncio.CancelledError:
+                mm.close()
+                os.close(fd)
+                raise
             except Exception as loop_e:
                 # [P0-5a FIX] Removed duplicate except block (dead code — second
                 # handler was never reachable and shadowed the first).
                 logging.critical(f"💥 CRITICAL SCANNER LOOP ERROR: {loop_e}")
                 await asyncio.sleep(1.0) # Prevent CPU spin on persistent error
+        # Normal exit: release SHM resources
+        mm.close()
+        os.close(fd)
 
 if __name__ == "__main__":
     from logging.handlers import RotatingFileHandler

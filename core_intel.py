@@ -250,6 +250,8 @@ class MarketIntelligence:
                         await asyncio.sleep(0.2)
                     self.last_struct_update = now
                 if now - self.last_gc_time > DISCOVERY_INTERVAL: self._run_gc()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logging.error(f"Intel Loop Error: {e}")
                 await asyncio.sleep(5)
@@ -274,6 +276,9 @@ class MarketIntelligence:
                                     val = float(o.get('q', 0)) * float(o.get('p', 0))
                                     s_type = 'SHORT' if side == 'BUY' else 'LONG'
                                     self._update_liq_stats(sym, val, s_type)
+            except asyncio.CancelledError:
+                self.ws_connected = False
+                raise
             except Exception as e:
                 logging.warning(f"Liq WS Disconnected: {e}. Retry in {backoff}s")
                 self.ws_connected = False
@@ -306,7 +311,11 @@ class MarketIntelligence:
                 
                 # [V61.5 Fix] Throttled Rotation: 0.2s -> ~5 req/s (Binance Safe Zone)
                 await asyncio.sleep(0.2) 
-            except Exception: await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.warning(f"OI pump error: {e}")
+                await asyncio.sleep(2)
 
     async def _throttled_oi_fetch(self, session, sym, headers):
         # [P1-3] Fire-and-forget: two mechanisms cap throughput:

@@ -93,8 +93,6 @@ class SharkTrader:
             cb_rows = conn.execute("SELECT * FROM circuit_breaker").fetchall()
             self.loss_streak = {r['symbol']: {'count': r['count'], 'last_time': r['last_time']} for r in cb_rows}
 
-    async def bootstrap(self): pass
-
     async def update_pnl(self, market_data: dict, intel, current_time: float) -> Tuple[None, None, List]:
         exit_list = []
         updates = []
@@ -305,7 +303,7 @@ class SharkTrader:
         # Use atomic increment in SQL to prevent race conditions
         conn.execute("UPDATE wallet SET balance = balance + ?, last_update=datetime('now') WHERE id=1", (p_usd,))
         conn.execute("INSERT INTO trade_history (time, symbol, side, entry, exit, pnl_pct, pnl_usd, reason, duration, details) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), sym, pos['type'], pos['entry'], ex_p, round(n_p*100, 2), round(p_usd, 2), reas, round(time.time()-pos['start_time'], 1), json.dumps(pos['details'])))
+                     (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), sym, pos['type'], pos['entry'], ex_p, round(n_p*100, 2), round(p_usd, 2), reas, round(time.time()-pos['start_time'], 1), json.dumps(pos['details'])))
 
     def _calculate_net_pnl(self, pos, curr_p) -> float:
         if curr_p <= 0: return 0.0

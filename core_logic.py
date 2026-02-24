@@ -403,7 +403,9 @@ class StrategyLogic:
             nfe_s, nfe_l = (eff_s / (abs(m['vel']) + 0.01)) * 100.0, (eff_l / (abs(m['vel']) + 0.01)) * 100.0
             p_boost = math.exp(min(NFE_BOOST_CAP, abs(m['vwap']) / NFE_BOOST_SCALING))
             return nfe_l * p_boost, nfe_s * p_boost
-        except Exception: return 0.0, 0.0
+        except Exception as e:
+            logging.debug(f"NFE calc failed [{sym}]: {e}")
+            return 0.0, 0.0
 
     @staticmethod
     def update_matrices_only(symbol: str, data: dict) -> Tuple[float, float]:
@@ -429,7 +431,8 @@ class StrategyLogic:
                 p_boost = math.exp(min(NFE_BOOST_CAP, abs(vwap) / NFE_BOOST_SCALING))
                 nfe_s   = (eff_s / (abs(vel) + 0.01)) * 100.0 * p_boost
                 nfe_l   = (eff_l / (abs(vel) + 0.01)) * 100.0 * p_boost
-            except Exception: pass
+            except Exception as e:
+                logging.debug(f"NFE matrix update failed [{symbol}]: {e}")
         StrategyLogic.nfe_matrix_long[symbol]  = nfe_l
         StrategyLogic.nfe_matrix_short[symbol] = nfe_s
         StrategyLogic.oi_matrix[symbol]        = max(0.0, oi_z)
