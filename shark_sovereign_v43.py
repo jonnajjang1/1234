@@ -302,7 +302,6 @@ class SovereignEngine:
                 await asyncio.sleep(1.0) # Prevent CPU spin on persistent error
 
 if __name__ == "__main__":
-    import logging
     from logging.handlers import RotatingFileHandler
     
     log_file = os.path.join(BASE_DIR, "logs/sovereign_v43.log")

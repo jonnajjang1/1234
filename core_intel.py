@@ -9,8 +9,6 @@ import random
 from collections import deque
 from core_constants import *
 
-logger = logging.getLogger("SOVEREIGN.Intel")
-
 class MarketIntelligence:
     def __init__(self):
         self.avg_vol_5m = {}
@@ -35,17 +33,15 @@ class MarketIntelligence:
         self.liq_z_cache = {'LONG': {}, 'SHORT': {}}
         self.trading_status = {}
         self.active_position_symbols = set()
-        self.candidate_symbols = set()
         self.data_timestamps = {}
         self.last_gc_time = time.time()
         self.last_status_check = 0
         self.last_ticker_check = 0
         self.last_struct_update = 0
+        self.last_symbol_update = 0
         self.ws_connected = False
         self.symbol_backoffs = {}
         self.oi_last_fetch = {}
-        self.oi_request_interval = 0.05
-        self.last_oi_request_time = 0
         self.api_key = None
         
         self.rsi_history = {} 
@@ -312,13 +308,10 @@ class MarketIntelligence:
             except Exception: await asyncio.sleep(2)
 
     async def _throttled_oi_fetch(self, session, sym, headers):
-        # [P1-3] Removed the per-call 20ms sleep. Two mechanisms already cap
-        # throughput without blocking the caller:
-        #   1. _run_oi_rest_pump sleeps 50ms per outer loop iteration (~20/s cap).
-        #   2. oi_semaphore(15) limits concurrent in-flight HTTP requests.
-        # The old sleep serialised the pump coroutine for no additional safety.
+        # [P1-3] Fire-and-forget: two mechanisms cap throughput:
+        #   1. _run_oi_rest_pump sleeps 200ms per outer loop iteration (~5/s cap).
+        #   2. oi_semaphore(5) limits concurrent in-flight HTTP requests.
         asyncio.create_task(self._fetch_single_oi(session, sym, headers))
-        self.last_oi_request_time = time.time()
 
     async def _fetch_single_oi(self, session, sym, headers):
         async with self.oi_semaphore: # --- PHASE 2: LIMIT IN-FLIGHT REQUESTS ---
@@ -400,7 +393,7 @@ class MarketIntelligence:
     def update_oi_snapshot(self, market_data):
         if not market_data: return
         now = time.time()
-        if now - getattr(self, 'last_symbol_update', 0) < DISCOVERY_INTERVAL: return
+        if now - self.last_symbol_update < DISCOVERY_INTERVAL: return
         new_s = set(market_data.keys()); current_s = set(self.symbols)
         if not new_s.issubset(current_s):
             self.symbols = sorted(list(current_s | new_s))[:100]; self.last_symbol_update = now
