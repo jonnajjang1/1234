@@ -31,7 +31,6 @@ class MarketIntelligence:
         self.liq_sum = {'LONG': {}, 'SHORT': {}}
         self.liq_sum_sq = {'LONG': {}, 'SHORT': {}}
         self.liq_z_cache = {'LONG': {}, 'SHORT': {}}
-        self.liq_intensity = {'LONG': {}, 'SHORT': {}} # [V61.5 FIX] Restore accidentally deleted intensity tracker
         self.trading_status = {}
         self.active_position_symbols = set()
         self.candidate_symbols = set()
@@ -42,6 +41,7 @@ class MarketIntelligence:
         self.last_struct_update = 0
         self.ws_connected = False
         self.symbol_backoffs = {}
+        self.oi_last_fetch = {}
         self.oi_request_interval = 0.05
         self.last_oi_request_time = 0
         self.api_key = None
@@ -284,11 +284,14 @@ class MarketIntelligence:
             try:
                 now = time.time(); headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
                 
-                # Priority 1: Active positions (Always sync every loop, check backoff)
+                # Priority 1: Active positions (per-symbol 2s cooldown to prevent burst)
                 priority = self.active_position_symbols
                 for sym in priority:
-                    if self.trading_status.get(sym) == 'TRADING' and now > self.symbol_backoffs.get(sym, 0):
+                    if (self.trading_status.get(sym) == 'TRADING'
+                            and now > self.symbol_backoffs.get(sym, 0)
+                            and now - self.oi_last_fetch.get(sym, 0) >= 2.0):
                         await self._throttled_oi_fetch(session, sym, headers)
+                        self.oi_last_fetch[sym] = now
                 
                 # Priority 2: Full Rotation (Conservative Stagger)
                 rotation_batch = 1
@@ -374,14 +377,14 @@ class MarketIntelligence:
     def _run_gc(self):
         active = set(self.symbols) | self.active_position_symbols
         # [V61.5 FIX] Enhanced GC for nested dicts and full state integrity (Fixes 4-C)
-        for attr in [self.avg_vol_5m, self.price_24h_change, self.struct_low_15m, self.struct_high_15m, self.data_timestamps, self.oi_data, self.oi_history, self.oi_z_cache, self.oi_sum, self.oi_sum_sq, self.oi_timestamps, self.cvd_history, self.cvd_sum, self.cvd_sum_sq, self.cvd_z_cache, self.rsi_history, self.rsi15_history, self.rsi_state, self.rsi15_state]:
+        for attr in [self.avg_vol_5m, self.price_24h_change, self.struct_low_15m, self.struct_high_15m, self.data_timestamps, self.oi_data, self.oi_history, self.oi_z_cache, self.oi_sum, self.oi_sum_sq, self.oi_timestamps, self.cvd_history, self.cvd_sum, self.cvd_sum_sq, self.cvd_z_cache, self.rsi_history, self.rsi15_history, self.rsi_state, self.rsi15_state, self.oi_last_fetch]:
             for k in list(attr.keys()):
                 if k not in active:
                     try: del attr[k]
                     except: pass
         
         # Handle nested dicts (Liquidation stats)
-        for group in [self.liq_history, self.liq_sum, self.liq_sum_sq, self.liq_z_cache, self.liq_intensity]:
+        for group in [self.liq_history, self.liq_sum, self.liq_sum_sq, self.liq_z_cache]:
             for side in ['LONG', 'SHORT']:
                 for k in list(group[side].keys()):
                     if k not in active:
