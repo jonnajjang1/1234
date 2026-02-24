@@ -216,7 +216,7 @@ class MarketIntelligence:
     def get_latest_metrics(self, sym: str) -> dict:
         return {'oi_z': self.oi_z_cache.get(sym, 0.0), 'cvd_z': self.cvd_z_cache.get(sym, 0.0), 'liq_l': self.liq_z_cache['LONG'].get(sym, 0.0), 'liq_s': self.liq_z_cache['SHORT'].get(sym, 0.0)}
 
-    async def run_intel_loop(self, session, log_func):
+    async def run_intel_loop(self, session):
         logging.info("🧪 Intel Loop Starting...")
         self.heartbeat_path = os.path.join(BASE_DIR, "logs/intel_heartbeat.ts")
         asyncio.create_task(self._run_liq_stream_loop())

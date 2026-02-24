@@ -9,8 +9,6 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 from core_constants import *
 
-BASE_DIR = "/home/ninano990707/shark_system"
-
 class SharkTrader:
     def __init__(self, config: dict):
         self.sys_cfg = config.get('system', {})

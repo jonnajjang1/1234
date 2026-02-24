@@ -33,7 +33,7 @@ class SovereignEngine:
             self.trader = core_trader.SharkTrader(CONFIG); self.trader.set_session(self.session)
             
             logging.info("🌟 Initializing Core Sub-tasks...")
-            intel_task = asyncio.create_task(self.intel.run_intel_loop(self.session, logging.info))
+            intel_task = asyncio.create_task(self.intel.run_intel_loop(self.session))
             trader_task = asyncio.create_task(self.run_trader_loop())
             scanner_task = asyncio.create_task(self.run_scanner_loop())
             discovery_task = asyncio.create_task(self.run_discovery_task())
@@ -79,14 +79,13 @@ class SovereignEngine:
                         
                         logging.info(f"🔄 Discovery: Found {len(top_100)} VALID top symbols (Filtered Dead Pairs).")
                         
-                        cfg_path = os.path.join(BASE_DIR, "shark_config.json")
-                        with open(cfg_path, 'r') as f: cfg = json.load(f)
-                        
+                        with open(CONFIG_PATH, 'r') as f: cfg = json.load(f)
+
                         current_keys = set(cfg['symbols'].keys())
                         new_keys = set(top_100)
-                        
+
                         logging.info(f"🔍 Discovery Debug: Current Keys={len(current_keys)}, New Keys={len(new_keys)}")
-                        
+
                         if current_keys != new_keys:
                             logging.info("♻️ Config Mismatch Detected. Updating...")
                             cfg['symbols'] = {s: 100000.0 for s in top_100}
@@ -95,13 +94,13 @@ class SovereignEngine:
                             # the C++ engine may read a partially-written JSON file,
                             # causing a parse failure and a missed reload.
                             # os.replace() is POSIX-atomic (single syscall rename).
-                            tmp_path = cfg_path + ".tmp"
+                            tmp_path = CONFIG_PATH + ".tmp"
                             with open(tmp_path, 'w') as f:
                                 json.dump(cfg, f, indent=4)
                                 f.flush()
                                 os.fsync(f.fileno())
-                            shutil.copy2(cfg_path, cfg_path + ".bak")
-                            os.replace(tmp_path, cfg_path)
+                            shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak")
+                            os.replace(tmp_path, CONFIG_PATH)
                             logging.info("💾 Config Saved. Triggering Rotation...")
                             subprocess.run(["pkill", "-SIGUSR1", "-f", "shark_engine_v37"], check=False)
                             logging.info("✅ Signal Sent.")
@@ -128,7 +127,7 @@ class SovereignEngine:
         metric_size = ctypes.sizeof(SharedMetric)
         fd = os.open(shm_path, os.O_RDWR); mm = mmap.mmap(fd, ctypes.sizeof(SharedMemoryBlock), mmap.MAP_SHARED); shm = SharedMemoryBlock.from_buffer(mm)
         
-        symbol_cache = {}; intel = self.intel; logic = core_logic.StrategyLogic
+        intel = self.intel; logic = core_logic.StrategyLogic
         last_pulse_time = 0
         
         # --- [LOG_EXT] INTEGRITY & AUDIT STATS ---
