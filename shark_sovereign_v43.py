@@ -1,4 +1,4 @@
-import mmap; import struct; import time; import os; import json; import asyncio; import aiohttp; import logging; import fcntl; import signal; import sys; import re; import sqlite3; import subprocess; import ctypes; import importlib; import heapq; import shutil
+import mmap; import struct; import time; import os; import json; import asyncio; import aiohttp; import logging; import fcntl; import signal; import sys; import re; import sqlite3; import subprocess; import ctypes; import importlib; import heapq; import shutil; import traceback
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
 BASE_DIR = "/home/ninano990707/shark_system"; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
@@ -43,7 +43,6 @@ class SovereignEngine:
             
         except Exception as e:
             logging.critical(f"💥 ENGINE CRITICAL FAILURE: {e}")
-            import traceback
             logging.error(traceback.format_exc())
         finally:
             if self.session: await self.session.close()
@@ -101,7 +100,7 @@ class SovereignEngine:
                                 json.dump(cfg, f, indent=4)
                                 f.flush()
                                 os.fsync(f.fileno())
-                            shutil.copy(cfg_path, cfg_path + ".bak")
+                            shutil.copy2(cfg_path, cfg_path + ".bak")
                             os.replace(tmp_path, cfg_path)
                             logging.info("💾 Config Saved. Triggering Rotation...")
                             subprocess.run(["pkill", "-SIGUSR1", "-f", "shark_engine_v37"], check=False)
@@ -325,5 +324,4 @@ if __name__ == "__main__":
         asyncio.run(engine.start())
     except Exception as e:
         logging.critical(f"💥 CRITICAL BOOT FAILURE: {e}")
-        import traceback
         logging.error(traceback.format_exc())

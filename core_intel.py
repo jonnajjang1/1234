@@ -225,7 +225,7 @@ class MarketIntelligence:
         self.heartbeat_path = os.path.join(BASE_DIR, "logs/intel_heartbeat.ts")
         asyncio.create_task(self._run_liq_stream_loop())
         try:
-            with open("shark_config.json", 'r') as f:
+            with open(CONFIG_PATH, 'r') as f:
                 cfg = json.load(f); self.api_key = cfg.get('api', {}).get('binance_key')
         except Exception as e: logging.error(f"Config Load Error: {e}")
         
@@ -262,11 +262,13 @@ class MarketIntelligence:
 
     async def _run_liq_stream_loop(self):
         url = "wss://fstream.binance.com/stream?streams=!forceOrder@arr"
+        backoff = 5
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, max_msg_size=0, heartbeat=15) as ws:
                         self.ws_connected = True
+                        backoff = 5  # Reset on successful connection
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 payload = json.loads(msg.data)
@@ -276,9 +278,10 @@ class MarketIntelligence:
                                     s_type = 'SHORT' if side == 'BUY' else 'LONG'
                                     self._update_liq_stats(sym, val, s_type)
             except Exception as e:
-                logging.warning(f"Liq WS Disconnected: {e}")
+                logging.warning(f"Liq WS Disconnected: {e}. Retry in {backoff}s")
                 self.ws_connected = False
-                await asyncio.sleep(5)
+                await asyncio.sleep(backoff)
+                backoff = min(30, backoff * 2)
 
     async def _run_oi_rest_pump(self, session):
         idx = 0
@@ -378,7 +381,7 @@ class MarketIntelligence:
     def _run_gc(self):
         active = set(self.symbols) | self.active_position_symbols
         # [V61.5 FIX] Enhanced GC for nested dicts and full state integrity (Fixes 4-C)
-        for attr in [self.avg_vol_5m, self.price_24h_change, self.struct_low_15m, self.struct_high_15m, self.data_timestamps, self.oi_data, self.oi_history, self.oi_z_cache, self.oi_sum, self.oi_sum_sq, self.oi_timestamps, self.cvd_history, self.cvd_sum, self.cvd_sum_sq, self.cvd_z_cache, self.rsi_history, self.rsi15_history, self.rsi_state, self.rsi15_state, self.oi_last_fetch]:
+        for attr in [self.avg_vol_5m, self.price_24h_change, self.struct_low_15m, self.struct_high_15m, self.data_timestamps, self.oi_data, self.oi_history, self.oi_z_cache, self.oi_sum, self.oi_sum_sq, self.oi_timestamps, self.cvd_history, self.cvd_sum, self.cvd_sum_sq, self.cvd_z_cache, self.rsi_history, self.rsi15_history, self.rsi_state, self.rsi15_state, self.oi_last_fetch, self.symbol_backoffs]:
             for k in list(attr.keys()):
                 if k not in active:
                     try: del attr[k]
