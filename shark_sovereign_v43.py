@@ -76,8 +76,6 @@ class SovereignEngine:
                             valid_data.append(t)
                         
                         # Sort by Volume
-                        
-                        # Sort by Volume
                         top_100 = [t['symbol'] for t in sorted(valid_data, key=lambda x: float(x['quoteVolume']), reverse=True)[:100]]
                         
                         logging.info(f"🔄 Discovery: Found {len(top_100)} VALID top symbols (Filtered Dead Pairs).")
@@ -230,7 +228,7 @@ class SovereignEngine:
                         try:
                             m.oi_z, m.oi_raw, m.rsi5, m.rsi15 = data['oi_z'], data['oi_raw'], r5_calib, r15_calib
                             m.score_short = m.score_long = 0.0  # final scores written in Pass 2 via m_ref
-                        except: pass
+                        except Exception: pass
 
                     except Exception as sym_e:
                         if "struct" not in str(sym_e): logging.error(f"⚠️ Scanner Error ({i}): {sym_e}")
@@ -267,7 +265,7 @@ class SovereignEngine:
                         if side == 'SHORT':  m_ref.score_short, m_ref.score_long = _raw, 0.0
                         elif side == 'LONG': m_ref.score_long,  m_ref.score_short = _raw, 0.0
                         else:                m_ref.score_short = m_ref.score_long = 0.0
-                    except: pass
+                    except Exception: pass
 
                     if sig == "SNIPER":
                         if sym not in intel.rsi_state:

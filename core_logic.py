@@ -285,7 +285,7 @@ class StrategyLogic:
     def _extract_metrics(data: dict, intel) -> dict:
         def sv(v, d=0.0):
             try: return float(v) if math.isfinite(float(v)) else d
-            except: return d
+            except Exception: return d
         # [P3-3] Readability: split the one-liner return into aligned multi-line dict.
         return {
             'dr':      sv(data.get('depth_ratio', 0)),
@@ -403,7 +403,7 @@ class StrategyLogic:
             nfe_s, nfe_l = (eff_s / (abs(m['vel']) + 0.01)) * 100.0, (eff_l / (abs(m['vel']) + 0.01)) * 100.0
             p_boost = math.exp(min(NFE_BOOST_CAP, abs(m['vwap']) / NFE_BOOST_SCALING))
             return nfe_l * p_boost, nfe_s * p_boost
-        except: return 0.0, 0.0
+        except Exception: return 0.0, 0.0
 
     @staticmethod
     def update_matrices_only(symbol: str, data: dict) -> Tuple[float, float]:
@@ -416,7 +416,7 @@ class StrategyLogic:
         """
         def sv(v, d=0.0):
             try: return float(v) if math.isfinite(float(v)) else d
-            except: return d
+            except Exception: return d
         vel   = sv(data.get('cvd_vel', 0))
         cvd_z = sv(data.get('cvd_z', 0))
         vwap  = max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0))))
@@ -429,7 +429,7 @@ class StrategyLogic:
                 p_boost = math.exp(min(NFE_BOOST_CAP, abs(vwap) / NFE_BOOST_SCALING))
                 nfe_s   = (eff_s / (abs(vel) + 0.01)) * 100.0 * p_boost
                 nfe_l   = (eff_l / (abs(vel) + 0.01)) * 100.0 * p_boost
-            except: pass
+            except Exception: pass
         StrategyLogic.nfe_matrix_long[symbol]  = nfe_l
         StrategyLogic.nfe_matrix_short[symbol] = nfe_s
         StrategyLogic.oi_matrix[symbol]        = max(0.0, oi_z)

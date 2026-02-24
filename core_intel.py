@@ -4,6 +4,8 @@ import time
 import json
 import logging
 import math
+import os
+import random
 from collections import deque
 from core_constants import *
 
@@ -220,7 +222,7 @@ class MarketIntelligence:
 
     async def run_intel_loop(self, session, log_func):
         logging.info("🧪 Intel Loop Starting...")
-        self.heartbeat_path = "/home/ninano990707/shark_system/logs/intel_heartbeat.ts"
+        self.heartbeat_path = os.path.join(BASE_DIR, "logs/intel_heartbeat.ts")
         asyncio.create_task(self._run_liq_stream_loop())
         try:
             with open("shark_config.json", 'r') as f:
@@ -304,7 +306,7 @@ class MarketIntelligence:
                 
                 # [V61.5 Fix] Throttled Rotation: 0.2s -> ~5 req/s (Binance Safe Zone)
                 await asyncio.sleep(0.2) 
-            except: await asyncio.sleep(2)
+            except Exception: await asyncio.sleep(2)
 
     async def _throttled_oi_fetch(self, session, sym, headers):
         # [P1-3] Removed the per-call 20ms sleep. Two mechanisms already cap
@@ -325,9 +327,8 @@ class MarketIntelligence:
                         if val > 0: self._update_oi_stats(sym, val)
                         # Clear backoff on success
                         self.symbol_backoffs[sym] = 0
-                    elif resp.status == 429: 
+                    elif resp.status == 429:
                         # PENALIZE ONLY THE OFFENDING SYMBOL
-                        import random
                         self.symbol_backoffs[sym] = time.time() + 30.0 + random.uniform(0, 30.0) # [V61.1 FIX] Add Jitter
                         logging.warning(f"⚠️ [INTEL] 429 for {sym}. Penalty: 30s")
             except asyncio.TimeoutError:
@@ -381,7 +382,7 @@ class MarketIntelligence:
             for k in list(attr.keys()):
                 if k not in active:
                     try: del attr[k]
-                    except: pass
+                    except Exception: pass
         
         # Handle nested dicts (Liquidation stats)
         for group in [self.liq_history, self.liq_sum, self.liq_sum_sq, self.liq_z_cache]:
@@ -389,7 +390,7 @@ class MarketIntelligence:
                 for k in list(group[side].keys()):
                     if k not in active:
                         try: del group[side][k]
-                        except: pass
+                        except Exception: pass
                         
         self.last_gc_time = time.time()
 
