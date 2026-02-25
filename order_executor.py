@@ -21,7 +21,7 @@ from typing import Optional
 import aiohttp
 
 from binance_signer import BinanceSigner
-from core_constants import FAPI_REST_BASE
+from core_constants import FAPI_REST_BASE, MAX_CAPITAL
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +170,7 @@ _FATAL_CODES = frozenset({-2019, -1111, -1116, -4131, -2015, -4028})
 class BinanceExecutor(OrderExecutor):
     """Binance Futures USDT-M live order executor."""
 
-    def __init__(self, session: aiohttp.ClientSession, config: dict,
+    def __init__(self, session: aiohttp.ClientSession,
                  signer: BinanceSigner):
         self.session = session
         self.signer = signer
@@ -178,9 +178,7 @@ class BinanceExecutor(OrderExecutor):
         self._leverage_cache: dict = {}
         self._rate_limiter = RateLimiter()
         self._order_log: list = []
-        self.max_capital = float(
-            config.get('system', {}).get('max_capital', 1000.0)
-        )
+        self.max_capital = MAX_CAPITAL
 
     # ------------------------------------------------------------------
     #  Lifecycle

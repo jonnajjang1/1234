@@ -30,10 +30,15 @@ class SharkTrader:
         self._init_db()
         self._load_state_from_db()
         self.executor = executor or PaperExecutor(self.wallet)
-        self.db_worker_task = asyncio.create_task(self._db_writer_worker())
+        self.db_worker_task = None  # Lazy: started by start_db_worker()
+
+    def start_db_worker(self):
+        """Start DB writer task. Must be called from an async context (running event loop)."""
+        if self.db_worker_task is None or self.db_worker_task.done():
+            self.db_worker_task = asyncio.create_task(self._db_writer_worker())
 
     def stop(self):
-        if hasattr(self, 'db_worker_task') and self.db_worker_task:
+        if self.db_worker_task and not self.db_worker_task.done():
             self.db_worker_task.cancel()
 
     async def _acquire_lock(self, context="unknown"):
@@ -85,10 +90,11 @@ class SharkTrader:
             conn.close()
 
     async def _ensure_db_worker(self):
-        """Auto-restart DB worker if it crashed."""
-        if self.db_worker_task.done():
-            exc = self.db_worker_task.exception() if not self.db_worker_task.cancelled() else None
-            logging.error(f"DB worker died ({exc}). Restarting...")
+        """Auto-start or restart DB worker if needed."""
+        if self.db_worker_task is None or self.db_worker_task.done():
+            if self.db_worker_task and self.db_worker_task.done():
+                exc = self.db_worker_task.exception() if not self.db_worker_task.cancelled() else None
+                logging.error(f"DB worker died ({exc}). Restarting...")
             self.db_worker_task = asyncio.create_task(self._db_writer_worker())
 
     async def _execute_db_task(self, func, *args):

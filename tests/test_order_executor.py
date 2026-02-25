@@ -70,8 +70,9 @@ class TestBinanceExecutor:
     @pytest.fixture
     def executor(self, mock_session):
         signer = BinanceSigner("key", "secret")
-        config = {"system": {"max_capital": 10000.0}}
-        return BinanceExecutor(mock_session, config, signer)
+        ex = BinanceExecutor(mock_session, signer)
+        ex.max_capital = 10000.0  # Override for test (default from core_constants is 1000)
+        return ex
 
     def _mock_response(self, session, status, body):
         """Helper: make session.get/post return a mock response."""

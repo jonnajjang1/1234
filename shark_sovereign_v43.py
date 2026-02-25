@@ -2,7 +2,7 @@ import mmap; import time; import os; import json; import asyncio; import aiohttp
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
 from core_constants import BASE_DIR; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
-from order_executor import PaperExecutor, BinanceExecutor
+from order_executor import BinanceExecutor
 from binance_signer import BinanceSigner
 
 # [P0-5c FIX] Explicit mapping from data-dict keys to get_latest_metrics() keys.
@@ -48,14 +48,15 @@ class SovereignEngine:
                     logging.critical("[Boot] No API key available. Set BINANCE_API_KEY env var.")
                     return
                 signer = BinanceSigner(api_key, BINANCE_API_SECRET)
-                executor = BinanceExecutor(self.session, CONFIG, signer)
+                executor = BinanceExecutor(self.session, signer)
                 await executor.initialize()
                 mode_str = "TESTNET (Live Orders)" if TESTNET else "LIVE TRADING"
             else:
-                executor = PaperExecutor({"balance": 10000.0})
+                executor = None  # SharkTrader will create PaperExecutor(self.wallet) internally
                 mode_str = "PAPER (Simulation)"
 
             self.trader = core_trader.SharkTrader(CONFIG, executor=executor)
+            self.trader.start_db_worker()
             self.trader.set_session(self.session)
 
             # Reconcile positions on startup (live mode only)
