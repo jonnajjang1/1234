@@ -25,7 +25,7 @@ class SharedMemoryBlock(ctypes.Structure):
 
 class SovereignEngine:
     def __init__(self):
-        self.intel = MarketIntelligence(); self.trader = None; self.session = None; self.running = True; self.heartbeat_path = os.path.join(BASE_DIR, "logs/sovereign_heartbeat.ts"); self.market_data_cache = {}; self.last_seq = {}; self.startup_time = time.time(); self.last_logic_gc = time.time()
+        self.intel = MarketIntelligence(); self.trader = None; self.session = None; self.running = True; self.heartbeat_path = os.path.join(BASE_DIR, "logs/sovereign_heartbeat.ts"); self.market_data_cache = {}; self.last_seq = {}; self.startup_time = time.time(); self.last_logic_gc = time.time(); self._background_tasks = set()
 
     async def start(self):
         try:
@@ -295,7 +295,8 @@ class SovereignEngine:
                 if results:
                     results.sort(key=lambda x: x[1], reverse=True)
                     for sym, score, side, mode, p, det in results[:3]: 
-                        asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, self.market_data_cache))
+                        task = asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, self.market_data_cache))
+                        self._background_tasks.add(task); task.add_done_callback(self._background_tasks.discard)
                 
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 

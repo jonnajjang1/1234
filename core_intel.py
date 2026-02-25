@@ -14,6 +14,7 @@ _SYMBOL_RE = re.compile(r'^[A-Z0-9]{2,20}USDT$')
 
 class MarketIntelligence:
     def __init__(self):
+        self._background_tasks: set = set()
         self.avg_vol_5m = {}
         self.price_24h_change = {}
         self.symbols = []
@@ -47,13 +48,22 @@ class MarketIntelligence:
         self.oi_last_fetch = {}
         self.api_key = None
         
-        self.rsi_history = {} 
+        self.rsi_history = {}
         self.rsi15_history = {}
-        self.rsi_state = {} 
+        self.rsi_state = {}
         self.rsi15_state = {}
         self.last_rsi_sync = 0
+        # --- PHASE 2: FAILURE TRACKING ---
+        self._fetch_failures = {}  # symbol → consecutive failure count
         # --- PHASE 2: CONCURRENCY CONTROL ---
         self._oi_semaphore = None
+
+    def _spawn_task(self, coro):
+        """Track fire-and-forget tasks so exceptions don't vanish silently."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     @property
     def oi_semaphore(self):
@@ -117,8 +127,11 @@ class MarketIntelligence:
                     self.rsi15_history[symbol] = {'last_close': prices[-2], 'last_ts': int(data[-1][0]) / 1000}
                     au15, ad15 = self._calculate_wilder_rsi(prices[:-1])
                     self.rsi15_state[symbol] = {'au': au15, 'ad': ad15, 'lp': prices[-2]}
+            self._fetch_failures[symbol] = 0  # Reset on success
         except Exception as e:
-            logging.warning(f"RSI Kline Fetch Failed [{symbol}]: {e}")
+            self._fetch_failures[symbol] = self._fetch_failures.get(symbol, 0) + 1
+            level = logging.ERROR if self._fetch_failures[symbol] >= 3 else logging.WARNING
+            logging.log(level, f"RSI Kline Fetch Failed [{symbol}] (x{self._fetch_failures[symbol]}): {e}")
 
     async def ensure_rsi_ready(self, session, symbol):
         """[V58.0 Patch] Ensure RSI is ready for new symbols."""
@@ -128,6 +141,8 @@ class MarketIntelligence:
     def get_calibrated_rsi(self, symbol, current_price):
         data = self.rsi_history.get(symbol); state = self.rsi_state.get(symbol)
         if not data or not state: return 0.0
+        if time.time() - data.get('last_ts', 0) > 600:
+            logging.debug(f"Stale RSI data for {symbol} (>{600}s old)")
         diff = current_price - state['lp']
         up = diff if diff > 0 else 0; down = -diff if diff < 0 else 0
         curr_au = (state['au'] * 13 + up) / 14; curr_ad = (state['ad'] * 13 + down) / 14
@@ -223,7 +238,7 @@ class MarketIntelligence:
     async def run_intel_loop(self, session):
         logging.info("🧪 Intel Loop Starting...")
         self.heartbeat_path = os.path.join(BASE_DIR, "logs/intel_heartbeat.ts")
-        asyncio.create_task(self._run_liq_stream_loop())
+        self._spawn_task(self._run_liq_stream_loop())
         try:
             self.api_key = os.environ.get('BINANCE_API_KEY')
             if not self.api_key:
@@ -239,9 +254,9 @@ class MarketIntelligence:
         await self._update_bulk_tickers(session)
         
         logging.info("📡 RSI Calibration starting in background...")
-        asyncio.create_task(self._sync_all_rsi_klines(session))
+        self._spawn_task(self._sync_all_rsi_klines(session))
         
-        asyncio.create_task(self._run_oi_rest_pump(session))
+        self._spawn_task(self._run_oi_rest_pump(session))
         self.last_status_check = self.last_ticker_check = time.time()
         logging.info("✅ Intel Initialized. Launching Pulse.")
         
@@ -277,14 +292,17 @@ class MarketIntelligence:
                         backoff = 5  # Reset on successful connection
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                payload = json.loads(msg.data)
-                                raw = payload.get('data')
-                                for item in (raw if isinstance(raw, list) else [raw]):
-                                    if not item: continue
-                                    o = item.get('o', {}); sym, side = o.get('s'), o.get('S')
-                                    val = float(o.get('q', 0)) * float(o.get('p', 0))
-                                    s_type = 'SHORT' if side == 'BUY' else 'LONG'
-                                    self._update_liq_stats(sym, val, s_type)
+                                try:
+                                    payload = json.loads(msg.data)
+                                    raw = payload.get('data')
+                                    for item in (raw if isinstance(raw, list) else [raw]):
+                                        if not item: continue
+                                        o = item.get('o', {}); sym, side = o.get('s'), o.get('S')
+                                        val = float(o.get('q', 0)) * float(o.get('p', 0))
+                                        s_type = 'SHORT' if side == 'BUY' else 'LONG'
+                                        self._update_liq_stats(sym, val, s_type)
+                                except Exception as parse_e:
+                                    logging.debug(f"Liq WS parse error: {parse_e}")
             except asyncio.CancelledError:
                 self.ws_connected = False
                 raise
@@ -330,7 +348,7 @@ class MarketIntelligence:
         # [P1-3] Fire-and-forget: two mechanisms cap throughput:
         #   1. _run_oi_rest_pump sleeps 200ms per outer loop iteration (~5/s cap).
         #   2. oi_semaphore(5) limits concurrent in-flight HTTP requests.
-        asyncio.create_task(self._fetch_single_oi(session, sym, headers))
+        self._spawn_task(self._fetch_single_oi(session, sym, headers))
 
     async def _fetch_single_oi(self, session, sym, headers):
         if not _SYMBOL_RE.match(sym): return
