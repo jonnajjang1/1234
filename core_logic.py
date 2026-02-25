@@ -276,7 +276,7 @@ class StrategyLogic:
             liq_triggered = abs(m['l_liq_z']) > WHALE_LIQ_Z_THRESHOLD or abs(m['s_liq_z']) > WHALE_LIQ_Z_THRESHOLD
             abs_triggered = abs_pwr > 1.0 and m['oi_z'] > 0.5
             if liq_triggered or abs_triggered:
-                 if m['oi_z'] > 0.2 and abs(m['cvd_z']) >= 0.3:
+                 if m['oi_z'] > WHALE_MIN_OI_Z_FORCE and abs(m['cvd_z']) >= 0.3:
                      mode = "WHALE-FORCE"
                      if liq_triggered:
                          side = "LONG" if m['s_liq_z'] > m['l_liq_z'] else "SHORT"
@@ -336,7 +336,7 @@ class StrategyLogic:
         if not (is_p_s or is_p_l or climax or mode == "WHALE-FORCE"):
             if side == "LONG" and not (m['rsi5'] < 55 and m['rsi15'] < 60): return "MTF_DISALIGN_L"
             if side == "SHORT" and not (m['rsi5'] > 45 and m['rsi15'] > 40): return "MTF_DISALIGN_S"
-        if mode == "WHALE-FORCE" and m['oi_z'] < 0.2: return "OI_OUTFLOW_VETO"
+        if mode == "WHALE-FORCE" and m['oi_z'] < WHALE_MIN_OI_Z_FORCE: return "OI_OUTFLOW_VETO"
         # [V61.1 FIX] Mitigate OI_TOO_WEAK block during 429 stale periods. High scores bypass this.
         if abs(m['oi_z']) < 0.5 and not climax and mode == "NONE" and m.get('s_score', 0) < 200.0: return "OI_TOO_WEAK" 
         return None

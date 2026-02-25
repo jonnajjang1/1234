@@ -32,6 +32,7 @@ class SovereignEngine:
             self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50, keepalive_timeout=60))
             self.trader = core_trader.SharkTrader(CONFIG); self.trader.set_session(self.session)
             
+            logging.info(f"🦈 Shark-Pulse {SYSTEM_VERSION} booting...")
             logging.info("🌟 Initializing Core Sub-tasks...")
             intel_task = asyncio.create_task(self.intel.run_intel_loop(self.session))
             trader_task = asyncio.create_task(self.run_trader_loop())
