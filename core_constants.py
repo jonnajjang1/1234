@@ -15,6 +15,29 @@ def load_full_config():
 
 # Single Source of Truth
 CONFIG = load_full_config()
+
+def _validate_config(cfg):
+    """Warn on invalid config values. Does not crash — graceful degradation."""
+    import logging
+    _c = cfg.get('constants', {})
+    _s = cfg.get('system', {})
+    checks = [
+        ('DEFAULT_LEVERAGE', _s, 1, 125, 10),
+        ('HARD_STOP_LOSS_NET', _c, -1.0, 0, -0.055),
+        ('FEE_RATE_TOTAL', _c, 0, 0.01, 0.0012),
+        ('GRACE_PERIOD_SEC', _c, 0, 3600, 300),
+    ]
+    for key, section, lo, hi, default in checks:
+        try:
+            val = float(section.get(key, default))
+            if not (lo <= val <= hi):
+                logging.warning(f"Config '{key}' = {val} out of range [{lo}, {hi}]. Using default {default}.")
+                section[key] = default
+        except (TypeError, ValueError):
+            logging.warning(f"Config '{key}' is not numeric. Using default {default}.")
+            section[key] = default
+
+_validate_config(CONFIG)
 _c = CONFIG.get('constants', {})
 _s = CONFIG.get('system', {})
 

@@ -4,9 +4,13 @@ import time
 import json
 import logging
 import os
+import re
 import random
+from urllib.parse import quote
 from collections import deque
 from core_constants import *
+
+_SYMBOL_RE = re.compile(r'^[A-Z0-9]{2,20}USDT$')
 
 class MarketIntelligence:
     def __init__(self):
@@ -93,9 +97,10 @@ class MarketIntelligence:
         self.last_rsi_sync = time.time()
 
     async def _fetch_rsi_kline(self, session, symbol):
+        if not _SYMBOL_RE.match(symbol): return
         headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
         try:
-            url5 = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=500"
+            url5 = f"https://fapi.binance.com/fapi/v1/klines?symbol={quote(symbol)}&interval=5m&limit=500"
             async with session.get(url5, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -104,7 +109,7 @@ class MarketIntelligence:
                     au, ad = self._calculate_wilder_rsi(prices[:-1])
                     self.rsi_state[symbol] = {'au': au, 'ad': ad, 'lp': prices[-2]}
             
-            url15 = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=500"
+            url15 = f"https://fapi.binance.com/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=500"
             async with session.get(url15, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -220,8 +225,12 @@ class MarketIntelligence:
         self.heartbeat_path = os.path.join(BASE_DIR, "logs/intel_heartbeat.ts")
         asyncio.create_task(self._run_liq_stream_loop())
         try:
-            with open(CONFIG_PATH, 'r') as f:
-                cfg = json.load(f); self.api_key = cfg.get('api', {}).get('binance_key')
+            self.api_key = os.environ.get('BINANCE_API_KEY')
+            if not self.api_key:
+                with open(CONFIG_PATH, 'r') as f:
+                    cfg = json.load(f); self.api_key = cfg.get('api', {}).get('binance_key')
+                if self.api_key:
+                    logging.warning("API key loaded from JSON config. Consider using BINANCE_API_KEY env var.")
         except Exception as e: logging.error(f"Config Load Error: {e}")
         
         logging.info("📡 Fetching Exchange Info...")
@@ -324,9 +333,10 @@ class MarketIntelligence:
         asyncio.create_task(self._fetch_single_oi(session, sym, headers))
 
     async def _fetch_single_oi(self, session, sym, headers):
+        if not _SYMBOL_RE.match(sym): return
         async with self.oi_semaphore: # --- PHASE 2: LIMIT IN-FLIGHT REQUESTS ---
             try:
-                url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}"
+                url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={quote(sym)}"
                 async with session.get(url, headers=headers, timeout=3) as resp:
                     if resp.status == 200:
                         val = float((await resp.json()).get('openInterest', 0))
@@ -375,7 +385,7 @@ class MarketIntelligence:
 
     async def _fetch_struct_only(self, session, symbol):
         try:
-            async with session.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3", timeout=5) as resp:
+            async with session.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=3", timeout=5) as resp:
                 if resp.status == 200:
                     res_k = await resp.json(); self.struct_low_15m[symbol] = float(res_k[-2][3]); self.struct_high_15m[symbol] = float(res_k[-2][2]); self.data_timestamps[symbol] = time.time()
         except Exception as e:

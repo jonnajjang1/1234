@@ -300,17 +300,15 @@ class SovereignEngine:
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 
             except asyncio.CancelledError:
-                mm.close()
-                os.close(fd)
                 raise
             except Exception as loop_e:
                 # [P0-5a FIX] Removed duplicate except block (dead code — second
                 # handler was never reachable and shadowed the first).
                 logging.critical(f"💥 CRITICAL SCANNER LOOP ERROR: {loop_e}")
                 await asyncio.sleep(1.0) # Prevent CPU spin on persistent error
-        # Normal exit: release SHM resources
-        mm.close()
-        os.close(fd)
+        finally:
+            mm.close()
+            os.close(fd)
 
 if __name__ == "__main__":
     from logging.handlers import RotatingFileHandler

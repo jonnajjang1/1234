@@ -131,6 +131,11 @@ class SharkTrader:
             if reason: exit_list.append((sym, curr_p, reason))
             elif is_new_peak: updates.append((sym, pos['details']))
         for sym, det in updates: await self._execute_db_task(self._db_update_details, sym, json.dumps(det))
+        # Orphan recovery: if is_closing stuck for >30s, release the lock
+        for sym, pos in pos_snapshot:
+            if pos.get('is_closing') and (current_time - pos.get('close_attempt_time', 0)) > 30:
+                pos['is_closing'] = False
+                logging.warning(f"Recovered orphaned position: {sym}")
         return None, None, exit_list
 
     def _db_update_details(self, conn, sym, det_json):
@@ -259,8 +264,9 @@ class SharkTrader:
         async with self.lock:
             if symbol not in self.positions: return
             pos = self.positions[symbol]
-            if pos.get('is_closing'): return 
+            if pos.get('is_closing'): return
             pos['is_closing'] = True
+            pos['close_attempt_time'] = time.time()
             
             net_pnl = self._calculate_net_pnl(pos, exit_price)
             pnl_usd = pos['entry_margin'] * net_pnl
@@ -368,8 +374,10 @@ class SharkTrader:
 
     async def send_telegram(self, msg):
         if not self.session or not self.tg_cfg.get('enabled'): return
-        url = f"https://api.telegram.org/bot{self.tg_cfg.get('token')}/sendMessage"
+        token = os.environ.get('SHARK_TG_TOKEN') or self.tg_cfg.get('token')
+        if not token: return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         try: await self.session.post(url, json={'chat_id': self.tg_cfg.get('chat_id'), 'text': msg, 'parse_mode': 'Markdown'})
-        except Exception as e: logging.debug(f"TG Send Failed: {e}")
+        except Exception as e: logging.debug(f"TG Send Failed: {type(e).__name__}")
 
     def set_session(self, session): self.session = session
