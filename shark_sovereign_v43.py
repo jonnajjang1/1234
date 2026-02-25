@@ -2,6 +2,8 @@ import mmap; import time; import os; import json; import asyncio; import aiohttp
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
 from core_constants import BASE_DIR; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
+from order_executor import PaperExecutor, BinanceExecutor
+from binance_signer import BinanceSigner
 
 # [P0-5c FIX] Explicit mapping from data-dict keys to get_latest_metrics() keys.
 # get_latest_metrics() returns: {oi_z, cvd_z, liq_l, liq_s}.
@@ -30,9 +32,30 @@ class SovereignEngine:
     async def start(self):
         try:
             self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50, keepalive_timeout=60))
-            self.trader = core_trader.SharkTrader(CONFIG); self.trader.set_session(self.session)
-            
-            mode_str = "TESTNET (Paper Trading)" if TESTNET else "LIVE (Real Trading)"
+
+            # --- Executor selection (runtime) ---
+            if LIVE_TRADING:
+                if not BINANCE_API_SECRET:
+                    logging.critical("[Boot] BINANCE_API_SECRET env var not set. Cannot start live trading.")
+                    return
+                api_key = os.environ.get('BINANCE_API_KEY') or CONFIG.get('api', {}).get('binance_key')
+                if not api_key:
+                    logging.critical("[Boot] No API key available. Set BINANCE_API_KEY env var.")
+                    return
+                signer = BinanceSigner(api_key, BINANCE_API_SECRET)
+                executor = BinanceExecutor(self.session, CONFIG, signer)
+                await executor.initialize()
+                mode_str = "TESTNET (Live Orders)" if TESTNET else "LIVE TRADING"
+            else:
+                executor = PaperExecutor({"balance": 10000.0})
+                mode_str = "PAPER (Simulation)"
+
+            self.trader = core_trader.SharkTrader(CONFIG, executor=executor)
+            self.trader.set_session(self.session)
+
+            # Reconcile positions on startup (live mode only)
+            await self.trader.reconcile_positions()
+
             logging.info(f"🦈 Shark-Pulse {SYSTEM_VERSION} booting... [{mode_str}]")
             logging.info(f"🌐 API: {FAPI_REST_BASE}")
             logging.info("🌟 Initializing Core Sub-tasks...")
@@ -40,9 +63,10 @@ class SovereignEngine:
             trader_task = asyncio.create_task(self.run_trader_loop())
             scanner_task = asyncio.create_task(self.run_scanner_loop())
             discovery_task = asyncio.create_task(self.run_discovery_task())
-            
+            sync_task = asyncio.create_task(self.run_sync_task())
+
             # Wait for all tasks to run concurrently. If any task crashes, it will be caught here.
-            await asyncio.gather(intel_task, trader_task, scanner_task, discovery_task)
+            await asyncio.gather(intel_task, trader_task, scanner_task, discovery_task, sync_task)
             
         except Exception as e:
             logging.critical(f"💥 ENGINE CRITICAL FAILURE: {e}")
@@ -113,6 +137,18 @@ class SovereignEngine:
                 raise
             except Exception as e: logging.error(f"Discovery Error: {e}")
             await asyncio.sleep(DISCOVERY_INTERVAL)
+
+    async def run_sync_task(self):
+        """Periodic balance & position reconciliation (live mode only)."""
+        while self.running:
+            try:
+                await self.trader.sync_balance()
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.error(f"Sync Task Error: {e}")
+                await asyncio.sleep(10)
 
     async def run_trader_loop(self):
         while self.running:

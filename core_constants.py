@@ -156,3 +156,8 @@ OI_DECOUPLE_SCALE = _c.get('OI_DECOUPLE_SCALE', 50.0)
 OI_DECOUPLE_CAP = _c.get('OI_DECOUPLE_CAP', 1.5)
 OI_DECOUPLE_WINDOW = int(_c.get('OI_DECOUPLE_WINDOW', 6))
 OI_DECOUPLE_INTERVAL = _c.get('OI_DECOUPLE_INTERVAL', 5.0)
+
+# --- LIVE TRADING ---
+LIVE_TRADING = bool(_s.get('live_trading', False))
+BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
+MAX_CAPITAL = float(_s.get('max_capital', 1000.0))

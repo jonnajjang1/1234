@@ -8,11 +8,12 @@ import math
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 from core_constants import *
+from order_executor import OrderExecutor, PaperExecutor
 
 class SharkTrader:
     LOCK_TIMEOUT = 10.0  # seconds — prevents deadlock on asyncio.Lock
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, executor: OrderExecutor = None):
         self.sys_cfg = config.get('system', {})
         self.tg_cfg = config.get('telegram', {})
         self.db_path = os.path.join(BASE_DIR, "logs/shark_vault.db")
@@ -28,6 +29,7 @@ class SharkTrader:
         self.db_queue = asyncio.Queue()
         self._init_db()
         self._load_state_from_db()
+        self.executor = executor or PaperExecutor(self.wallet)
         self.db_worker_task = asyncio.create_task(self._db_writer_worker())
 
     def stop(self):
@@ -281,13 +283,23 @@ class SharkTrader:
             margin = self.wallet['balance'] * self.margin_ratio * conf
             qty = self._format_qty(symbol, (margin * DEFAULT_LEVERAGE) / price, intel)
             if qty <= 0: return False
-            pos = {'entry': price, 'type': side, 'qty': qty, 'entry_margin': margin, 'lev': DEFAULT_LEVERAGE, 'start_time': time.time(), 'details': {**details, "max_price": price}}
+
+            # --- EXECUTOR: Place order on exchange (paper or live) ---
+            result = await self.executor.open_order(symbol, side, qty, DEFAULT_LEVERAGE)
+            if not result.success:
+                logging.warning(f"[Executor] Open order failed: {symbol} {result.error_msg}")
+                return False
+
+            fill_price = result.avg_price if result.avg_price > 0 else price
+            fill_qty = result.executed_qty if result.executed_qty > 0 else qty
+
+            pos = {'entry': fill_price, 'type': side, 'qty': fill_qty, 'entry_margin': margin, 'lev': DEFAULT_LEVERAGE, 'start_time': time.time(), 'details': {**details, "max_price": fill_price}}
             self.positions[symbol] = pos
 
             # [V61.5 FIX] DB task must be queued INSIDE lock to prevent race with close_position
-            self._spawn_task(self._execute_db_task(self._db_add_pos, symbol, price, side, qty, margin, DEFAULT_LEVERAGE, pos['details']))
+            self._spawn_task(self._execute_db_task(self._db_add_pos, symbol, fill_price, side, fill_qty, margin, DEFAULT_LEVERAGE, pos['details']))
 
-            self._notify_open(symbol, side, price, score, mode, details)
+            self._notify_open(symbol, side, fill_price, score, mode, details)
             return True
         finally:
             self.lock.release()
@@ -304,25 +316,45 @@ class SharkTrader:
             if pos.get('is_closing'): return
             pos['is_closing'] = True
             pos['close_attempt_time'] = time.time()
+        finally:
+            self.lock.release()
 
-            net_pnl = self._calculate_net_pnl(pos, exit_price)
-            pnl_usd = pos['entry_margin'] * net_pnl
+        # 2. EXECUTOR: Place close order on exchange (lock released for async call)
+        result = await self.executor.close_order(symbol, pos['type'], pos['qty'])
+        if not result.success:
+            logging.error(f"[Executor] Close order failed: {symbol} {result.error_msg}")
+            if not await self._acquire_lock("close_position_exec_fail"):
+                return
+            try:
+                if symbol in self.positions: self.positions[symbol]['is_closing'] = False
+            finally:
+                self.lock.release()
+            return
 
-            # --- IRONSHIELD: ANOMALY PNL PROTECTION ---
-            if abs(pnl_usd) > 5000.0:
-                logging.critical(f"🚨 [IronShield] ANOMALY DETECTED: {symbol} PnL ${pnl_usd:.2f}!")
+        # 3. PNL CALCULATION (actual fill price from exchange)
+        actual_exit = result.avg_price if result.avg_price > 0 else exit_price
+        net_pnl = self._calculate_net_pnl(pos, actual_exit)
+        pnl_usd = pos['entry_margin'] * net_pnl
 
-            # [V60.3 FIX] Transactional Integrity: DB First, Memory Second
+        # --- IRONSHIELD: ANOMALY PNL PROTECTION ---
+        if abs(pnl_usd) > 5000.0:
+            logging.critical(f"🚨 [IronShield] ANOMALY DETECTED: {symbol} PnL ${pnl_usd:.2f}!")
+
+        # 4. DB WRITE (RE-LOCK)
+        if not await self._acquire_lock("close_position_db"):
+            return
+        try:
+            if symbol not in self.positions: return
             future = asyncio.Future()
-            await self._execute_db_task_with_confirm(self._db_close_pos, future, symbol, exit_price, net_pnl, pnl_usd, reason, pos)
+            await self._execute_db_task_with_confirm(self._db_close_pos, future, symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
         finally:
             self.lock.release()
 
         try:
-            # 2. DB WAIT (LOCK RELEASED)
+            # 5. DB WAIT (LOCK RELEASED)
             await asyncio.wait_for(future, timeout=5.0)
 
-            # 3. FINALIZATION (RE-LOCK)
+            # 6. FINALIZATION (RE-LOCK)
             if not await self._acquire_lock("close_position_finalize"):
                 return
             try:
@@ -336,7 +368,7 @@ class SharkTrader:
                 else:
                     self.loss_streak[symbol] = {'count': 0, 'last_time': 0}
 
-                self._notify_close(symbol, pos, exit_price, net_pnl, pnl_usd, reason)
+                self._notify_close(symbol, pos, actual_exit, net_pnl, pnl_usd, reason)
                 del self.positions[symbol]
             finally:
                 self.lock.release()
@@ -427,3 +459,61 @@ class SharkTrader:
         except Exception as e: logging.debug(f"TG Send Failed: {type(e).__name__}")
 
     def set_session(self, session): self.session = session
+
+    # ------------------------------------------------------------------
+    #  Live Trading: Balance & Position Sync
+    # ------------------------------------------------------------------
+
+    async def sync_balance(self):
+        """Cross-check local wallet against exchange.  Paper mode is a no-op."""
+        if isinstance(self.executor, PaperExecutor):
+            return
+        exchange_balance = await self.executor.get_balance()
+        if exchange_balance <= 0:
+            return
+        local_balance = self.wallet['balance']
+        drift = abs(exchange_balance - local_balance)
+        if drift > max(1.0, local_balance * 0.01):
+            logging.warning(
+                f"[Sync] Balance drift: exchange=${exchange_balance:.2f} "
+                f"local=${local_balance:.2f} (delta=${drift:.2f})"
+            )
+            self.wallet['balance'] = exchange_balance
+            await self._execute_db_task(self._db_set_balance, exchange_balance)
+
+    def _db_set_balance(self, conn, balance):
+        conn.execute("UPDATE wallet SET balance=?, last_update=datetime('now') WHERE id=1", (balance,))
+
+    async def reconcile_positions(self):
+        """Sync local positions with exchange on startup.  Paper mode is a no-op."""
+        if isinstance(self.executor, PaperExecutor):
+            return
+
+        exchange_pos = await self.executor.get_positions()
+        local_syms = set(self.positions.keys())
+        exchange_syms = set(exchange_pos.keys())
+
+        # Case 1: On exchange but not local (manual trade or restart)
+        for sym in exchange_syms - local_syms:
+            ep = exchange_pos[sym]
+            logging.warning(f"[Reconcile] Untracked position found: {sym}. Registering locally.")
+            self.positions[sym] = {
+                'entry': ep['entry'], 'type': ep['type'], 'qty': ep['qty'],
+                'entry_margin': ep['entry'] * ep['qty'] / ep['leverage'],
+                'lev': ep['leverage'], 'start_time': time.time(),
+                'details': {'mode': 'RECOVERED', 'max_price': ep['entry']},
+            }
+            await self._execute_db_task(
+                self._db_add_pos, sym, ep['entry'], ep['type'], ep['qty'],
+                ep['entry'] * ep['qty'] / ep['leverage'], ep['leverage'],
+                self.positions[sym]['details'],
+            )
+
+        # Case 2: Local but not on exchange (manually closed or liquidated)
+        for sym in local_syms - exchange_syms:
+            logging.warning(f"[Reconcile] Ghost position removed: {sym}")
+            del self.positions[sym]
+            await self._execute_db_task(self._db_remove_pos, sym)
+
+    def _db_remove_pos(self, conn, sym):
+        conn.execute("DELETE FROM active_positions WHERE symbol=?", (sym,))

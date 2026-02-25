@@ -70,7 +70,9 @@
         "SHM_PATH": "/dev/shm/shark_shm_test",
         "DEFAULT_LEVERAGE": 10,
         "max_positions": 5,
-        "testnet": true
+        "testnet": true,
+        "live_trading": false,
+        "max_capital": 1000.0
     },
     "telegram": {
         "enabled": false,
