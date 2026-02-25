@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Secrets - NEVER commit
+shark_config.json
+shark_config.json.bak
+shark_config.json.tmp
+*.env
