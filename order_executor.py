@@ -122,30 +122,41 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self, weight: int = 1):
-        async with self._lock:
-            now = time.time()
+        # Compute wait times under lock, then sleep outside lock to avoid blocking others.
+        while True:
+            weight_wait = 0.0
+            order_wait = 0.0
+            async with self._lock:
+                now = time.time()
 
-            # Purge stale entries
-            while self._weight_window and now - self._weight_window[0][0] > 60:
-                self._weight_window.popleft()
-            while self._order_window and now - self._order_window[0] > 1:
-                self._order_window.popleft()
+                # Purge stale entries
+                while self._weight_window and now - self._weight_window[0][0] > 60:
+                    self._weight_window.popleft()
+                while self._order_window and now - self._order_window[0] > 1:
+                    self._order_window.popleft()
 
-            # Weight gate
-            total_weight = sum(w for _, w in self._weight_window)
-            if total_weight + weight > self.max_weight:
-                wait = 60 - (now - self._weight_window[0][0])
-                logging.warning(f"[RateLimit] weight cap — waiting {wait:.1f}s")
-                await asyncio.sleep(max(0, wait) + 0.1)
+                # Weight gate
+                total_weight = sum(w for _, w in self._weight_window)
+                if total_weight + weight > self.max_weight:
+                    weight_wait = 60 - (now - self._weight_window[0][0]) + 0.1
 
-            # Order-per-second gate
-            if len(self._order_window) >= self.max_orders:
-                wait = 1.0 - (now - self._order_window[0])
-                if wait > 0:
-                    await asyncio.sleep(wait + 0.05)
+                # Order-per-second gate
+                if len(self._order_window) >= self.max_orders:
+                    wait = 1.0 - (now - self._order_window[0])
+                    if wait > 0:
+                        order_wait = wait + 0.05
 
-            self._weight_window.append((time.time(), weight))
-            self._order_window.append(time.time())
+                # If no wait needed, record and return immediately
+                if weight_wait <= 0 and order_wait <= 0:
+                    self._weight_window.append((time.time(), weight))
+                    self._order_window.append(time.time())
+                    return
+
+            # Sleep outside lock, then re-check
+            total_sleep = max(weight_wait, order_wait)
+            if weight_wait > 0:
+                logging.warning(f"[RateLimit] weight cap — waiting {weight_wait:.1f}s")
+            await asyncio.sleep(total_sleep)
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +323,8 @@ class BinanceExecutor(OrderExecutor):
 
     async def _ping(self):
         async with self.session.get(
-            f"{self.base_url}/fapi/v1/ping", timeout=5
+            f"{self.base_url}/fapi/v1/ping",
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             if resp.status != 200:
                 raise ConnectionError("Binance API ping failed")
@@ -334,7 +346,7 @@ class BinanceExecutor(OrderExecutor):
             try:
                 if method == 'GET':
                     async with self.session.get(
-                        url, params=signed, headers=headers, timeout=10
+                        url, params=signed, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
                         body = await resp.json()
                         self._log_api(method, path, signed, body, resp.status)
@@ -343,12 +355,15 @@ class BinanceExecutor(OrderExecutor):
                         if resp.status == 429:
                             await asyncio.sleep(min(30, 2 ** (attempt + 1)))
                             continue
-                        # Non-200 GET — return body for caller inspection
+                        # Retry GET on server errors (5xx)
+                        if resp.status >= 500 and attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
                         return body
 
-                elif method in ('POST', 'PUT'):
+                elif method == 'POST':
                     async with self.session.post(
-                        url, data=signed, headers=headers, timeout=10
+                        url, data=signed, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
                         body = await resp.json()
                         self._log_api(method, path, signed, body, resp.status)
@@ -373,9 +388,25 @@ class BinanceExecutor(OrderExecutor):
                             continue
                         return body
 
+                elif method == 'PUT':
+                    async with self.session.put(
+                        url, data=signed, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        body = await resp.json()
+                        self._log_api(method, path, signed, body, resp.status)
+                        if resp.status == 200:
+                            return body
+                        code = body.get('code', 0)
+                        if code in _FATAL_CODES:
+                            return body
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return body
+
                 elif method == 'DELETE':
                     async with self.session.delete(
-                        url, params=signed, headers=headers, timeout=10
+                        url, params=signed, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
                         body = await resp.json()
                         self._log_api(method, path, signed, body, resp.status)

@@ -49,8 +49,13 @@ class SharkTrader:
         """Track fire-and-forget tasks so exceptions don't vanish silently."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._on_task_done)
         return task
+
+    def _on_task_done(self, task):
+        self._background_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logging.error(f"[BackgroundTask] Failed: {task.exception()}")
 
     async def _db_writer_worker(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -341,10 +346,14 @@ class SharkTrader:
             logging.critical(f"🚨 [IronShield] ANOMALY DETECTED: {symbol} PnL ${pnl_usd:.2f}!")
 
         # 4. DB WRITE (RE-LOCK)
+        # Critical: exchange has already filled. Lock failure must NOT leave position orphaned.
         if not await self._acquire_lock("close_position_db"):
+            logging.critical(f"[CRITICAL] Lock timeout after exchange fill for {symbol}. Scheduling forced cleanup.")
+            self._schedule_forced_cleanup(symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
             return
         try:
-            if symbol not in self.positions: return
+            if symbol not in self.positions:
+                return
             future = asyncio.Future()
             await self._execute_db_task_with_confirm(self._db_close_pos, future, symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
         finally:
@@ -356,11 +365,13 @@ class SharkTrader:
 
             # 6. FINALIZATION (RE-LOCK)
             if not await self._acquire_lock("close_position_finalize"):
+                logging.critical(f"[CRITICAL] Lock timeout at finalize for {symbol}. Scheduling forced cleanup.")
+                self._schedule_forced_cleanup(symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
                 return
             try:
-                if symbol not in self.positions: return
+                if symbol not in self.positions:
+                    return
 
-                # SUCCESS: Apply atomic increment to balance
                 self.wallet['balance'] += pnl_usd
 
                 if net_pnl < LOSS_STREAK_THRESHOLD:
@@ -374,13 +385,30 @@ class SharkTrader:
                 self.lock.release()
 
         except Exception as e:
-            logging.error(f"❌ [DB] Close failed for {symbol}: {e}. State retained.")
-            if not await self._acquire_lock("close_position_recover"):
-                return
-            try:
-                if symbol in self.positions: self.positions[symbol]['is_closing'] = False
-            finally:
-                self.lock.release()
+            logging.error(f"[DB] Close failed for {symbol}: {e}. Scheduling forced cleanup.")
+            self._schedule_forced_cleanup(symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
+
+    def _schedule_forced_cleanup(self, symbol, exit_price, net_pnl, pnl_usd, reason, pos):
+        """Emergency cleanup after exchange fill when lock/DB fails. Retries until state is consistent."""
+        async def _force_cleanup():
+            for attempt in range(5):
+                await asyncio.sleep(2 ** attempt)
+                if not await self._acquire_lock("forced_cleanup"):
+                    continue
+                try:
+                    if symbol not in self.positions:
+                        return  # Already cleaned up (e.g. by reconcile)
+                    self.wallet['balance'] += pnl_usd
+                    del self.positions[symbol]
+                    await self._execute_db_task(self._db_close_pos, symbol, exit_price, net_pnl, pnl_usd, reason, pos)
+                    logging.warning(f"[ForcedCleanup] Successfully cleaned up {symbol} on attempt {attempt + 1}")
+                    return
+                except Exception as e:
+                    logging.error(f"[ForcedCleanup] Attempt {attempt + 1} failed for {symbol}: {e}")
+                finally:
+                    self.lock.release()
+            logging.critical(f"[ForcedCleanup] FAILED after 5 attempts for {symbol}. Manual intervention required.")
+        self._spawn_task(_force_cleanup())
 
     def _db_close_pos(self, conn, sym, ex_p, n_p, p_usd, reas, pos):
         conn.execute("DELETE FROM active_positions WHERE symbol=?", (sym,))
@@ -471,49 +499,61 @@ class SharkTrader:
         exchange_balance = await self.executor.get_balance()
         if exchange_balance <= 0:
             return
-        local_balance = self.wallet['balance']
-        drift = abs(exchange_balance - local_balance)
-        if drift > max(1.0, local_balance * 0.01):
-            logging.warning(
-                f"[Sync] Balance drift: exchange=${exchange_balance:.2f} "
-                f"local=${local_balance:.2f} (delta=${drift:.2f})"
-            )
-            self.wallet['balance'] = exchange_balance
-            await self._execute_db_task(self._db_set_balance, exchange_balance)
+        # Hold lock during read+write to prevent race with close_position Phase 6
+        if not await self._acquire_lock("sync_balance"):
+            return
+        try:
+            local_balance = self.wallet['balance']
+            drift = abs(exchange_balance - local_balance)
+            if drift > max(1.0, local_balance * 0.01):
+                logging.warning(
+                    f"[Sync] Balance drift: exchange=${exchange_balance:.2f} "
+                    f"local=${local_balance:.2f} (delta=${drift:.2f})"
+                )
+                self.wallet['balance'] = exchange_balance
+                await self._execute_db_task(self._db_set_balance, exchange_balance)
+        finally:
+            self.lock.release()
 
     def _db_set_balance(self, conn, balance):
         conn.execute("UPDATE wallet SET balance=?, last_update=datetime('now') WHERE id=1", (balance,))
 
     async def reconcile_positions(self):
-        """Sync local positions with exchange on startup.  Paper mode is a no-op."""
+        """Sync local positions with exchange.  Paper mode is a no-op."""
         if isinstance(self.executor, PaperExecutor):
             return
 
         exchange_pos = await self.executor.get_positions()
-        local_syms = set(self.positions.keys())
-        exchange_syms = set(exchange_pos.keys())
 
-        # Case 1: On exchange but not local (manual trade or restart)
-        for sym in exchange_syms - local_syms:
-            ep = exchange_pos[sym]
-            logging.warning(f"[Reconcile] Untracked position found: {sym}. Registering locally.")
-            self.positions[sym] = {
-                'entry': ep['entry'], 'type': ep['type'], 'qty': ep['qty'],
-                'entry_margin': ep['entry'] * ep['qty'] / ep['leverage'],
-                'lev': ep['leverage'], 'start_time': time.time(),
-                'details': {'mode': 'RECOVERED', 'max_price': ep['entry']},
-            }
-            await self._execute_db_task(
-                self._db_add_pos, sym, ep['entry'], ep['type'], ep['qty'],
-                ep['entry'] * ep['qty'] / ep['leverage'], ep['leverage'],
-                self.positions[sym]['details'],
-            )
+        if not await self._acquire_lock("reconcile_positions"):
+            return
+        try:
+            local_syms = set(self.positions.keys())
+            exchange_syms = set(exchange_pos.keys())
 
-        # Case 2: Local but not on exchange (manually closed or liquidated)
-        for sym in local_syms - exchange_syms:
-            logging.warning(f"[Reconcile] Ghost position removed: {sym}")
-            del self.positions[sym]
-            await self._execute_db_task(self._db_remove_pos, sym)
+            # Case 1: On exchange but not local (manual trade or restart)
+            for sym in exchange_syms - local_syms:
+                ep = exchange_pos[sym]
+                logging.warning(f"[Reconcile] Untracked position found: {sym}. Registering locally.")
+                self.positions[sym] = {
+                    'entry': ep['entry'], 'type': ep['type'], 'qty': ep['qty'],
+                    'entry_margin': ep['entry'] * ep['qty'] / ep['leverage'],
+                    'lev': ep['leverage'], 'start_time': time.time(),
+                    'details': {'mode': 'RECOVERED', 'max_price': ep['entry']},
+                }
+                await self._execute_db_task(
+                    self._db_add_pos, sym, ep['entry'], ep['type'], ep['qty'],
+                    ep['entry'] * ep['qty'] / ep['leverage'], ep['leverage'],
+                    self.positions[sym]['details'],
+                )
+
+            # Case 2: Local but not on exchange (manually closed or liquidated)
+            for sym in local_syms - exchange_syms:
+                logging.warning(f"[Reconcile] Ghost position removed: {sym}")
+                del self.positions[sym]
+                await self._execute_db_task(self._db_remove_pos, sym)
+        finally:
+            self.lock.release()
 
     def _db_remove_pos(self, conn, sym):
         conn.execute("DELETE FROM active_positions WHERE symbol=?", (sym,))

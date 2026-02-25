@@ -29,6 +29,11 @@ class SovereignEngine:
     def __init__(self):
         self.intel = MarketIntelligence(); self.trader = None; self.session = None; self.running = True; self.heartbeat_path = os.path.join(BASE_DIR, "logs/sovereign_heartbeat.ts"); self.market_data_cache = {}; self.last_seq = {}; self.startup_time = time.time(); self.last_logic_gc = time.time(); self._background_tasks = set()
 
+    def _on_bg_task_done(self, task):
+        self._background_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logging.error(f"[BackgroundTask] Failed: {task.exception()}")
+
     async def start(self):
         try:
             self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50, keepalive_timeout=60))
@@ -140,9 +145,15 @@ class SovereignEngine:
 
     async def run_sync_task(self):
         """Periodic balance & position reconciliation (live mode only)."""
+        reconcile_counter = 0
         while self.running:
             try:
                 await self.trader.sync_balance()
+                reconcile_counter += 1
+                # Reconcile positions every ~5 minutes (10 cycles * 30s)
+                if reconcile_counter >= 10:
+                    await self.trader.reconcile_positions()
+                    reconcile_counter = 0
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
                 raise
@@ -332,9 +343,9 @@ class SovereignEngine:
 
                 if results:
                     results.sort(key=lambda x: x[1], reverse=True)
-                    for sym, score, side, mode, p, det in results[:3]: 
+                    for sym, score, side, mode, p, det in results[:3]:
                         task = asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, self.market_data_cache))
-                        self._background_tasks.add(task); task.add_done_callback(self._background_tasks.discard)
+                        self._background_tasks.add(task); task.add_done_callback(self._on_bg_task_done)
                 
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 
