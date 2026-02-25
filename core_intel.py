@@ -110,7 +110,7 @@ class MarketIntelligence:
         if not _SYMBOL_RE.match(symbol): return
         headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
         try:
-            url5 = f"https://fapi.binance.com/fapi/v1/klines?symbol={quote(symbol)}&interval=5m&limit=500"
+            url5 = f"{FAPI_REST_BASE}/fapi/v1/klines?symbol={quote(symbol)}&interval=5m&limit=500"
             async with session.get(url5, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -119,7 +119,7 @@ class MarketIntelligence:
                     au, ad = self._calculate_wilder_rsi(prices[:-1])
                     self.rsi_state[symbol] = {'au': au, 'ad': ad, 'lp': prices[-2]}
             
-            url15 = f"https://fapi.binance.com/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=500"
+            url15 = f"{FAPI_REST_BASE}/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=500"
             async with session.get(url15, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -282,7 +282,7 @@ class MarketIntelligence:
             await asyncio.sleep(1)
 
     async def _run_liq_stream_loop(self):
-        url = "wss://fstream.binance.com/stream?streams=!forceOrder@arr"
+        url = f"{FAPI_WS_BASE}/stream?streams=!forceOrder@arr"
         backoff = 5
         while True:
             try:
@@ -354,7 +354,7 @@ class MarketIntelligence:
         if not _SYMBOL_RE.match(sym): return
         async with self.oi_semaphore: # --- PHASE 2: LIMIT IN-FLIGHT REQUESTS ---
             try:
-                url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={quote(sym)}"
+                url = f"{FAPI_REST_BASE}/fapi/v1/openInterest?symbol={quote(sym)}"
                 async with session.get(url, headers=headers, timeout=3) as resp:
                     if resp.status == 200:
                         val = float((await resp.json()).get('openInterest', 0))
@@ -372,7 +372,7 @@ class MarketIntelligence:
 
     async def _update_exchange_info(self, session):
         try:
-            async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10) as resp:
+            async with session.get(f"{FAPI_REST_BASE}/fapi/v1/exchangeInfo", timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     self.trading_status = {s['symbol']: s['status'] for s in data['symbols']}
@@ -384,7 +384,7 @@ class MarketIntelligence:
 
     async def _update_bulk_tickers(self, session):
         try:
-            async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10) as resp:
+            async with session.get(f"{FAPI_REST_BASE}/fapi/v1/ticker/24hr", timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     # [V60.0 FIX] Dead Symbol Purge: Only process TRADING symbols
@@ -403,7 +403,7 @@ class MarketIntelligence:
 
     async def _fetch_struct_only(self, session, symbol):
         try:
-            async with session.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=3", timeout=5) as resp:
+            async with session.get(f"{FAPI_REST_BASE}/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=3", timeout=5) as resp:
                 if resp.status == 200:
                     res_k = await resp.json(); self.struct_low_15m[symbol] = float(res_k[-2][3]); self.struct_high_15m[symbol] = float(res_k[-2][2]); self.data_timestamps[symbol] = time.time()
         except Exception as e:

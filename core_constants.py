@@ -41,6 +41,21 @@ _validate_config(CONFIG)
 _c = CONFIG.get('constants', {})
 _s = CONFIG.get('system', {})
 
+# --- NETWORK MODE ---
+TESTNET = bool(_s.get('testnet', False))
+
+# Binance Futures endpoints
+if TESTNET:
+    FAPI_REST_BASE = "https://testnet.binancefuture.com"
+    FAPI_WS_BASE = "wss://stream.binancefuture.com"
+    FAPI_WS_HOST = "stream.binancefuture.com"
+    FAPI_REST_HOST = "testnet.binancefuture.com"
+else:
+    FAPI_REST_BASE = "https://fapi.binance.com"
+    FAPI_WS_BASE = "wss://fstream.binance.com"
+    FAPI_WS_HOST = "fstream.binance.com"
+    FAPI_REST_HOST = "fapi.binance.com"
+
 # --- SYSTEM METADATA ---
 SYSTEM_VERSION = _s.get('VERSION', "V58.0-HYPERNOVA")
 SHM_PATH = _s.get('SHM_PATH', "/dev/shm/shark_shm_v60")

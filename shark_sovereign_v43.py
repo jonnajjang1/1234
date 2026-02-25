@@ -32,7 +32,9 @@ class SovereignEngine:
             self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50, keepalive_timeout=60))
             self.trader = core_trader.SharkTrader(CONFIG); self.trader.set_session(self.session)
             
-            logging.info(f"🦈 Shark-Pulse {SYSTEM_VERSION} booting...")
+            mode_str = "TESTNET (Paper Trading)" if TESTNET else "LIVE (Real Trading)"
+            logging.info(f"🦈 Shark-Pulse {SYSTEM_VERSION} booting... [{mode_str}]")
+            logging.info(f"🌐 API: {FAPI_REST_BASE}")
             logging.info("🌟 Initializing Core Sub-tasks...")
             intel_task = asyncio.create_task(self.intel.run_intel_loop(self.session))
             trader_task = asyncio.create_task(self.run_trader_loop())
@@ -58,7 +60,7 @@ class SovereignEngine:
                     await asyncio.sleep(5)
                     continue
 
-                async with self.session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10) as resp:
+                async with self.session.get(f"{FAPI_REST_BASE}/fapi/v1/ticker/24hr", timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         # Strict Filtering: USDT only AND Status == TRADING AND Valid Format

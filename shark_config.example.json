@@ -69,7 +69,8 @@
         "VERSION": "V58.0-TEST",
         "SHM_PATH": "/dev/shm/shark_shm_test",
         "DEFAULT_LEVERAGE": 10,
-        "max_positions": 5
+        "max_positions": 5,
+        "testnet": true
     },
     "telegram": {
         "enabled": false,
