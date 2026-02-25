@@ -1,6 +1,6 @@
 import mmap; import time; import os; import json; import asyncio; import aiohttp; import logging; import sys; import re; import subprocess; import ctypes; import heapq; import shutil; import traceback
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
-BASE_DIR = "/home/ninano990707/shark_system"; sys.path.append(BASE_DIR)
+from core_constants import BASE_DIR; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
 
 # [P0-5c FIX] Explicit mapping from data-dict keys to get_latest_metrics() keys.

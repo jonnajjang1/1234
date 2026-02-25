@@ -1,7 +1,7 @@
 import json
 import os
 
-BASE_DIR = "/home/ninano990707/shark_system"
+BASE_DIR = os.environ.get('SHARK_BASE_DIR', os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "shark_config.json")
 
 def load_full_config():
