@@ -3,14 +3,18 @@ import aiohttp
 import time
 import json
 import logging
-import math
+import os
+import re
+import random
+from urllib.parse import quote
 from collections import deque
 from core_constants import *
 
-logger = logging.getLogger("SOVEREIGN.Intel")
+_SYMBOL_RE = re.compile(r'^[A-Z0-9]{2,20}USDT$')
 
 class MarketIntelligence:
     def __init__(self):
+        self._background_tasks: set = set()
         self.avg_vol_5m = {}
         self.price_24h_change = {}
         self.symbols = []
@@ -31,28 +35,35 @@ class MarketIntelligence:
         self.liq_sum = {'LONG': {}, 'SHORT': {}}
         self.liq_sum_sq = {'LONG': {}, 'SHORT': {}}
         self.liq_z_cache = {'LONG': {}, 'SHORT': {}}
-        self.liq_intensity = {'LONG': {}, 'SHORT': {}} # [V61.5 FIX] Restore accidentally deleted intensity tracker
         self.trading_status = {}
         self.active_position_symbols = set()
-        self.candidate_symbols = set()
         self.data_timestamps = {}
         self.last_gc_time = time.time()
         self.last_status_check = 0
         self.last_ticker_check = 0
         self.last_struct_update = 0
+        self.last_symbol_update = 0
         self.ws_connected = False
         self.symbol_backoffs = {}
-        self.oi_request_interval = 0.05
-        self.last_oi_request_time = 0
+        self.oi_last_fetch = {}
         self.api_key = None
         
-        self.rsi_history = {} 
+        self.rsi_history = {}
         self.rsi15_history = {}
-        self.rsi_state = {} 
+        self.rsi_state = {}
         self.rsi15_state = {}
         self.last_rsi_sync = 0
+        # --- PHASE 2: FAILURE TRACKING ---
+        self._fetch_failures = {}  # symbol → consecutive failure count
         # --- PHASE 2: CONCURRENCY CONTROL ---
         self._oi_semaphore = None
+
+    def _spawn_task(self, coro):
+        """Track fire-and-forget tasks so exceptions don't vanish silently."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     @property
     def oi_semaphore(self):
@@ -96,9 +107,10 @@ class MarketIntelligence:
         self.last_rsi_sync = time.time()
 
     async def _fetch_rsi_kline(self, session, symbol):
+        if not _SYMBOL_RE.match(symbol): return
         headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
         try:
-            url5 = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=500"
+            url5 = f"{FAPI_REST_BASE}/fapi/v1/klines?symbol={quote(symbol)}&interval=5m&limit=500"
             async with session.get(url5, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -107,7 +119,7 @@ class MarketIntelligence:
                     au, ad = self._calculate_wilder_rsi(prices[:-1])
                     self.rsi_state[symbol] = {'au': au, 'ad': ad, 'lp': prices[-2]}
             
-            url15 = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=500"
+            url15 = f"{FAPI_REST_BASE}/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=500"
             async with session.get(url15, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -115,8 +127,11 @@ class MarketIntelligence:
                     self.rsi15_history[symbol] = {'last_close': prices[-2], 'last_ts': int(data[-1][0]) / 1000}
                     au15, ad15 = self._calculate_wilder_rsi(prices[:-1])
                     self.rsi15_state[symbol] = {'au': au15, 'ad': ad15, 'lp': prices[-2]}
+            self._fetch_failures[symbol] = 0  # Reset on success
         except Exception as e:
-            logging.warning(f"RSI Kline Fetch Failed [{symbol}]: {e}")
+            self._fetch_failures[symbol] = self._fetch_failures.get(symbol, 0) + 1
+            level = logging.ERROR if self._fetch_failures[symbol] >= 3 else logging.WARNING
+            logging.log(level, f"RSI Kline Fetch Failed [{symbol}] (x{self._fetch_failures[symbol]}): {e}")
 
     async def ensure_rsi_ready(self, session, symbol):
         """[V58.0 Patch] Ensure RSI is ready for new symbols."""
@@ -126,6 +141,8 @@ class MarketIntelligence:
     def get_calibrated_rsi(self, symbol, current_price):
         data = self.rsi_history.get(symbol); state = self.rsi_state.get(symbol)
         if not data or not state: return 0.0
+        if time.time() - data.get('last_ts', 0) > 600:
+            logging.debug(f"Stale RSI data for {symbol} (>{600}s old)")
         diff = current_price - state['lp']
         up = diff if diff > 0 else 0; down = -diff if diff < 0 else 0
         curr_au = (state['au'] * 13 + up) / 14; curr_ad = (state['ad'] * 13 + down) / 14
@@ -218,13 +235,17 @@ class MarketIntelligence:
     def get_latest_metrics(self, sym: str) -> dict:
         return {'oi_z': self.oi_z_cache.get(sym, 0.0), 'cvd_z': self.cvd_z_cache.get(sym, 0.0), 'liq_l': self.liq_z_cache['LONG'].get(sym, 0.0), 'liq_s': self.liq_z_cache['SHORT'].get(sym, 0.0)}
 
-    async def run_intel_loop(self, session, log_func):
+    async def run_intel_loop(self, session):
         logging.info("🧪 Intel Loop Starting...")
-        self.heartbeat_path = "/home/ninano990707/shark_system/logs/intel_heartbeat.ts"
-        asyncio.create_task(self._run_liq_stream_loop())
+        self.heartbeat_path = os.path.join(BASE_DIR, "logs/intel_heartbeat.ts")
+        self._spawn_task(self._run_liq_stream_loop())
         try:
-            with open("shark_config.json", 'r') as f:
-                cfg = json.load(f); self.api_key = cfg.get('api', {}).get('binance_key')
+            self.api_key = os.environ.get('BINANCE_API_KEY')
+            if not self.api_key:
+                with open(CONFIG_PATH, 'r') as f:
+                    cfg = json.load(f); self.api_key = cfg.get('api', {}).get('binance_key')
+                if self.api_key:
+                    logging.warning("API key loaded from JSON config. Consider using BINANCE_API_KEY env var.")
         except Exception as e: logging.error(f"Config Load Error: {e}")
         
         logging.info("📡 Fetching Exchange Info...")
@@ -233,9 +254,9 @@ class MarketIntelligence:
         await self._update_bulk_tickers(session)
         
         logging.info("📡 RSI Calibration starting in background...")
-        asyncio.create_task(self._sync_all_rsi_klines(session))
+        self._spawn_task(self._sync_all_rsi_klines(session))
         
-        asyncio.create_task(self._run_oi_rest_pump(session))
+        self._spawn_task(self._run_oi_rest_pump(session))
         self.last_status_check = self.last_ticker_check = time.time()
         logging.info("✅ Intel Initialized. Launching Pulse.")
         
@@ -253,30 +274,43 @@ class MarketIntelligence:
                         await asyncio.sleep(0.2)
                     self.last_struct_update = now
                 if now - self.last_gc_time > DISCOVERY_INTERVAL: self._run_gc()
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logging.error(f"Intel Loop Error: {e}")
                 await asyncio.sleep(5)
             await asyncio.sleep(1)
 
     async def _run_liq_stream_loop(self):
-        url = "wss://fstream.binance.com/stream?streams=!forceOrder@arr"
+        url = f"{FAPI_WS_BASE}/stream?streams=!forceOrder@arr"
+        backoff = 5
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(url, max_msg_size=0, heartbeat=15) as ws:
                         self.ws_connected = True
+                        backoff = 5  # Reset on successful connection
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                payload = json.loads(msg.data)
-                                for item in (payload.get('data', []) if isinstance(payload.get('data'), list) else [payload.get('data')]):
-                                    o = item.get('o', {}); sym, side = o.get('s'), o.get('S')
-                                    val = float(o.get('q', 0)) * float(o.get('p', 0))
-                                    s_type = 'SHORT' if side == 'BUY' else 'LONG'
-                                    self._update_liq_stats(sym, val, s_type)
-            except Exception as e:
-                logging.warning(f"Liq WS Disconnected: {e}")
+                                try:
+                                    payload = json.loads(msg.data)
+                                    raw = payload.get('data')
+                                    for item in (raw if isinstance(raw, list) else [raw]):
+                                        if not item: continue
+                                        o = item.get('o', {}); sym, side = o.get('s'), o.get('S')
+                                        val = float(o.get('q', 0)) * float(o.get('p', 0))
+                                        s_type = 'SHORT' if side == 'BUY' else 'LONG'
+                                        self._update_liq_stats(sym, val, s_type)
+                                except Exception as parse_e:
+                                    logging.debug(f"Liq WS parse error: {parse_e}")
+            except asyncio.CancelledError:
                 self.ws_connected = False
-                await asyncio.sleep(5)
+                raise
+            except Exception as e:
+                logging.warning(f"Liq WS Disconnected: {e}. Retry in {backoff}s")
+                self.ws_connected = False
+                await asyncio.sleep(backoff)
+                backoff = min(30, backoff * 2)
 
     async def _run_oi_rest_pump(self, session):
         idx = 0
@@ -284,11 +318,14 @@ class MarketIntelligence:
             try:
                 now = time.time(); headers = {'X-MBX-APIKEY': self.api_key} if self.api_key else {}
                 
-                # Priority 1: Active positions (Always sync every loop, check backoff)
-                priority = self.active_position_symbols
+                # Priority 1: Active positions (per-symbol 2s cooldown to prevent burst)
+                priority = set(self.active_position_symbols)  # Snapshot to avoid RuntimeError during iteration
                 for sym in priority:
-                    if self.trading_status.get(sym) == 'TRADING' and now > self.symbol_backoffs.get(sym, 0):
+                    if (self.trading_status.get(sym) == 'TRADING'
+                            and now > self.symbol_backoffs.get(sym, 0)
+                            and now - self.oi_last_fetch.get(sym, 0) >= 2.0):
                         await self._throttled_oi_fetch(session, sym, headers)
+                        self.oi_last_fetch[sym] = now
                 
                 # Priority 2: Full Rotation (Conservative Stagger)
                 rotation_batch = 1
@@ -301,30 +338,31 @@ class MarketIntelligence:
                 
                 # [V61.5 Fix] Throttled Rotation: 0.2s -> ~5 req/s (Binance Safe Zone)
                 await asyncio.sleep(0.2) 
-            except: await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.warning(f"OI pump error: {e}")
+                await asyncio.sleep(2)
 
     async def _throttled_oi_fetch(self, session, sym, headers):
-        # [P1-3] Removed the per-call 20ms sleep. Two mechanisms already cap
-        # throughput without blocking the caller:
-        #   1. _run_oi_rest_pump sleeps 50ms per outer loop iteration (~20/s cap).
-        #   2. oi_semaphore(15) limits concurrent in-flight HTTP requests.
-        # The old sleep serialised the pump coroutine for no additional safety.
-        asyncio.create_task(self._fetch_single_oi(session, sym, headers))
-        self.last_oi_request_time = time.time()
+        # [P1-3] Fire-and-forget: two mechanisms cap throughput:
+        #   1. _run_oi_rest_pump sleeps 200ms per outer loop iteration (~5/s cap).
+        #   2. oi_semaphore(5) limits concurrent in-flight HTTP requests.
+        self._spawn_task(self._fetch_single_oi(session, sym, headers))
 
     async def _fetch_single_oi(self, session, sym, headers):
+        if not _SYMBOL_RE.match(sym): return
         async with self.oi_semaphore: # --- PHASE 2: LIMIT IN-FLIGHT REQUESTS ---
             try:
-                url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}"
+                url = f"{FAPI_REST_BASE}/fapi/v1/openInterest?symbol={quote(sym)}"
                 async with session.get(url, headers=headers, timeout=3) as resp:
                     if resp.status == 200:
                         val = float((await resp.json()).get('openInterest', 0))
                         if val > 0: self._update_oi_stats(sym, val)
                         # Clear backoff on success
                         self.symbol_backoffs[sym] = 0
-                    elif resp.status == 429: 
+                    elif resp.status == 429:
                         # PENALIZE ONLY THE OFFENDING SYMBOL
-                        import random
                         self.symbol_backoffs[sym] = time.time() + 30.0 + random.uniform(0, 30.0) # [V61.1 FIX] Add Jitter
                         logging.warning(f"⚠️ [INTEL] 429 for {sym}. Penalty: 30s")
             except asyncio.TimeoutError:
@@ -334,7 +372,7 @@ class MarketIntelligence:
 
     async def _update_exchange_info(self, session):
         try:
-            async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10) as resp:
+            async with session.get(f"{FAPI_REST_BASE}/fapi/v1/exchangeInfo", timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     self.trading_status = {s['symbol']: s['status'] for s in data['symbols']}
@@ -346,7 +384,7 @@ class MarketIntelligence:
 
     async def _update_bulk_tickers(self, session):
         try:
-            async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10) as resp:
+            async with session.get(f"{FAPI_REST_BASE}/fapi/v1/ticker/24hr", timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     # [V60.0 FIX] Dead Symbol Purge: Only process TRADING symbols
@@ -365,7 +403,7 @@ class MarketIntelligence:
 
     async def _fetch_struct_only(self, session, symbol):
         try:
-            async with session.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=15m&limit=3", timeout=5) as resp:
+            async with session.get(f"{FAPI_REST_BASE}/fapi/v1/klines?symbol={quote(symbol)}&interval=15m&limit=3", timeout=5) as resp:
                 if resp.status == 200:
                     res_k = await resp.json(); self.struct_low_15m[symbol] = float(res_k[-2][3]); self.struct_high_15m[symbol] = float(res_k[-2][2]); self.data_timestamps[symbol] = time.time()
         except Exception as e:
@@ -374,26 +412,26 @@ class MarketIntelligence:
     def _run_gc(self):
         active = set(self.symbols) | self.active_position_symbols
         # [V61.5 FIX] Enhanced GC for nested dicts and full state integrity (Fixes 4-C)
-        for attr in [self.avg_vol_5m, self.price_24h_change, self.struct_low_15m, self.struct_high_15m, self.data_timestamps, self.oi_data, self.oi_history, self.oi_z_cache, self.oi_sum, self.oi_sum_sq, self.oi_timestamps, self.cvd_history, self.cvd_sum, self.cvd_sum_sq, self.cvd_z_cache, self.rsi_history, self.rsi15_history, self.rsi_state, self.rsi15_state]:
+        for attr in [self.avg_vol_5m, self.price_24h_change, self.struct_low_15m, self.struct_high_15m, self.data_timestamps, self.oi_data, self.oi_history, self.oi_z_cache, self.oi_sum, self.oi_sum_sq, self.oi_timestamps, self.cvd_history, self.cvd_sum, self.cvd_sum_sq, self.cvd_z_cache, self.rsi_history, self.rsi15_history, self.rsi_state, self.rsi15_state, self.oi_last_fetch, self.symbol_backoffs]:
             for k in list(attr.keys()):
                 if k not in active:
                     try: del attr[k]
-                    except: pass
+                    except Exception: pass
         
         # Handle nested dicts (Liquidation stats)
-        for group in [self.liq_history, self.liq_sum, self.liq_sum_sq, self.liq_z_cache, self.liq_intensity]:
+        for group in [self.liq_history, self.liq_sum, self.liq_sum_sq, self.liq_z_cache]:
             for side in ['LONG', 'SHORT']:
                 for k in list(group[side].keys()):
                     if k not in active:
                         try: del group[side][k]
-                        except: pass
+                        except Exception: pass
                         
         self.last_gc_time = time.time()
 
     def update_oi_snapshot(self, market_data):
         if not market_data: return
         now = time.time()
-        if now - getattr(self, 'last_symbol_update', 0) < DISCOVERY_INTERVAL: return
+        if now - self.last_symbol_update < DISCOVERY_INTERVAL: return
         new_s = set(market_data.keys()); current_s = set(self.symbols)
         if not new_s.issubset(current_s):
             self.symbols = sorted(list(current_s | new_s))[:100]; self.last_symbol_update = now

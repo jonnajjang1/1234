@@ -1,7 +1,9 @@
-import mmap; import struct; import time; import os; import json; import asyncio; import aiohttp; import logging; import fcntl; import signal; import sys; import re; import sqlite3; import subprocess; import ctypes; import importlib; import heapq; import shutil
+import mmap; import time; import os; import json; import asyncio; import aiohttp; import logging; import sys; import re; import subprocess; import ctypes; import heapq; import shutil; import traceback
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
-BASE_DIR = "/home/ninano990707/shark_system"; sys.path.append(BASE_DIR)
+from core_constants import BASE_DIR; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
+from order_executor import BinanceExecutor
+from binance_signer import BinanceSigner
 
 # [P0-5c FIX] Explicit mapping from data-dict keys to get_latest_metrics() keys.
 # get_latest_metrics() returns: {oi_z, cvd_z, liq_l, liq_s}.
@@ -25,25 +27,55 @@ class SharedMemoryBlock(ctypes.Structure):
 
 class SovereignEngine:
     def __init__(self):
-        self.intel = MarketIntelligence(); self.trader = None; self.session = None; self.running = True; self.heartbeat_path = os.path.join(BASE_DIR, "logs/sovereign_heartbeat.ts"); self.market_data_cache = {}; self.last_seq = {}; self.startup_time = time.time(); self.last_logic_gc = time.time()
+        self.intel = MarketIntelligence(); self.trader = None; self.session = None; self.running = True; self.heartbeat_path = os.path.join(BASE_DIR, "logs/sovereign_heartbeat.ts"); self.market_data_cache = {}; self.last_seq = {}; self.startup_time = time.time(); self.last_logic_gc = time.time(); self._background_tasks = set()
+
+    def _on_bg_task_done(self, task):
+        self._background_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logging.error(f"[BackgroundTask] Failed: {task.exception()}")
 
     async def start(self):
         try:
             self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50, keepalive_timeout=60))
-            self.trader = core_trader.SharkTrader(CONFIG); self.trader.set_session(self.session)
-            
+
+            # --- Executor selection (runtime) ---
+            if LIVE_TRADING:
+                if not BINANCE_API_SECRET:
+                    logging.critical("[Boot] BINANCE_API_SECRET env var not set. Cannot start live trading.")
+                    return
+                api_key = os.environ.get('BINANCE_API_KEY') or CONFIG.get('api', {}).get('binance_key')
+                if not api_key:
+                    logging.critical("[Boot] No API key available. Set BINANCE_API_KEY env var.")
+                    return
+                signer = BinanceSigner(api_key, BINANCE_API_SECRET)
+                executor = BinanceExecutor(self.session, signer)
+                await executor.initialize()
+                mode_str = "TESTNET (Live Orders)" if TESTNET else "LIVE TRADING"
+            else:
+                executor = None  # SharkTrader will create PaperExecutor(self.wallet) internally
+                mode_str = "PAPER (Simulation)"
+
+            self.trader = core_trader.SharkTrader(CONFIG, executor=executor)
+            self.trader.start_db_worker()
+            self.trader.set_session(self.session)
+
+            # Reconcile positions on startup (live mode only)
+            await self.trader.reconcile_positions()
+
+            logging.info(f"🦈 Shark-Pulse {SYSTEM_VERSION} booting... [{mode_str}]")
+            logging.info(f"🌐 API: {FAPI_REST_BASE}")
             logging.info("🌟 Initializing Core Sub-tasks...")
-            intel_task = asyncio.create_task(self.intel.run_intel_loop(self.session, logging.info))
+            intel_task = asyncio.create_task(self.intel.run_intel_loop(self.session))
             trader_task = asyncio.create_task(self.run_trader_loop())
             scanner_task = asyncio.create_task(self.run_scanner_loop())
             discovery_task = asyncio.create_task(self.run_discovery_task())
-            
+            sync_task = asyncio.create_task(self.run_sync_task())
+
             # Wait for all tasks to run concurrently. If any task crashes, it will be caught here.
-            await asyncio.gather(intel_task, trader_task, scanner_task, discovery_task)
+            await asyncio.gather(intel_task, trader_task, scanner_task, discovery_task, sync_task)
             
         except Exception as e:
             logging.critical(f"💥 ENGINE CRITICAL FAILURE: {e}")
-            import traceback
             logging.error(traceback.format_exc())
         finally:
             if self.session: await self.session.close()
@@ -58,7 +90,7 @@ class SovereignEngine:
                     await asyncio.sleep(5)
                     continue
 
-                async with self.session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10) as resp:
+                async with self.session.get(f"{FAPI_REST_BASE}/fapi/v1/ticker/24hr", timeout=10) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         # Strict Filtering: USDT only AND Status == TRADING AND Valid Format
@@ -76,20 +108,17 @@ class SovereignEngine:
                             valid_data.append(t)
                         
                         # Sort by Volume
-                        
-                        # Sort by Volume
                         top_100 = [t['symbol'] for t in sorted(valid_data, key=lambda x: float(x['quoteVolume']), reverse=True)[:100]]
                         
                         logging.info(f"🔄 Discovery: Found {len(top_100)} VALID top symbols (Filtered Dead Pairs).")
                         
-                        cfg_path = os.path.join(BASE_DIR, "shark_config.json")
-                        with open(cfg_path, 'r') as f: cfg = json.load(f)
-                        
+                        with open(CONFIG_PATH, 'r') as f: cfg = json.load(f)
+
                         current_keys = set(cfg['symbols'].keys())
                         new_keys = set(top_100)
-                        
+
                         logging.info(f"🔍 Discovery Debug: Current Keys={len(current_keys)}, New Keys={len(new_keys)}")
-                        
+
                         if current_keys != new_keys:
                             logging.info("♻️ Config Mismatch Detected. Updating...")
                             cfg['symbols'] = {s: 100000.0 for s in top_100}
@@ -98,20 +127,40 @@ class SovereignEngine:
                             # the C++ engine may read a partially-written JSON file,
                             # causing a parse failure and a missed reload.
                             # os.replace() is POSIX-atomic (single syscall rename).
-                            tmp_path = cfg_path + ".tmp"
+                            tmp_path = CONFIG_PATH + ".tmp"
                             with open(tmp_path, 'w') as f:
                                 json.dump(cfg, f, indent=4)
                                 f.flush()
                                 os.fsync(f.fileno())
-                            shutil.copy(cfg_path, cfg_path + ".bak")
-                            os.replace(tmp_path, cfg_path)
+                            shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak")
+                            os.replace(tmp_path, CONFIG_PATH)
                             logging.info("💾 Config Saved. Triggering Rotation...")
                             subprocess.run(["pkill", "-SIGUSR1", "-f", "shark_engine_v37"], check=False)
                             logging.info("✅ Signal Sent.")
                         else:
                             logging.info("💤 Config matches. No rotation needed.")
+            except asyncio.CancelledError:
+                raise
             except Exception as e: logging.error(f"Discovery Error: {e}")
             await asyncio.sleep(DISCOVERY_INTERVAL)
+
+    async def run_sync_task(self):
+        """Periodic balance & position reconciliation (live mode only)."""
+        reconcile_counter = 0
+        while self.running:
+            try:
+                await self.trader.sync_balance()
+                reconcile_counter += 1
+                # Reconcile positions every ~5 minutes (10 cycles * 30s)
+                if reconcile_counter >= 10:
+                    await self.trader.reconcile_positions()
+                    reconcile_counter = 0
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logging.error(f"Sync Task Error: {e}")
+                await asyncio.sleep(10)
 
     async def run_trader_loop(self):
         while self.running:
@@ -122,6 +171,8 @@ class SovereignEngine:
                         logging.info(f"🚪 EXIT TRIGGERED: {sym} for {reason}")
                         await self.trader.close_position(sym, price, reason, self.market_data_cache.get(sym))
                 await asyncio.sleep(SCANNER_SLEEP_TICK)
+            except asyncio.CancelledError:
+                raise
             except Exception as e: logging.error(f"Trader Loop Error: {e}")
 
     async def run_scanner_loop(self):
@@ -131,7 +182,7 @@ class SovereignEngine:
         metric_size = ctypes.sizeof(SharedMetric)
         fd = os.open(shm_path, os.O_RDWR); mm = mmap.mmap(fd, ctypes.sizeof(SharedMemoryBlock), mmap.MAP_SHARED); shm = SharedMemoryBlock.from_buffer(mm)
         
-        symbol_cache = {}; intel = self.intel; logic = core_logic.StrategyLogic
+        intel = self.intel; logic = core_logic.StrategyLogic
         last_pulse_time = 0
         
         # --- [LOG_EXT] INTEGRITY & AUDIT STATS ---
@@ -230,7 +281,7 @@ class SovereignEngine:
                         try:
                             m.oi_z, m.oi_raw, m.rsi5, m.rsi15 = data['oi_z'], data['oi_raw'], r5_calib, r15_calib
                             m.score_short = m.score_long = 0.0  # final scores written in Pass 2 via m_ref
-                        except: pass
+                        except Exception as e: logging.debug(f"SHM writeback failed [{sym}]: {e}")
 
                     except Exception as sym_e:
                         if "struct" not in str(sym_e): logging.error(f"⚠️ Scanner Error ({i}): {sym_e}")
@@ -267,7 +318,7 @@ class SovereignEngine:
                         if side == 'SHORT':  m_ref.score_short, m_ref.score_long = _raw, 0.0
                         elif side == 'LONG': m_ref.score_long,  m_ref.score_short = _raw, 0.0
                         else:                m_ref.score_short = m_ref.score_long = 0.0
-                    except: pass
+                    except Exception as e: logging.debug(f"SHM score write failed [{sym}]: {e}")
 
                     if sig == "SNIPER":
                         if sym not in intel.rsi_state:
@@ -293,19 +344,24 @@ class SovereignEngine:
 
                 if results:
                     results.sort(key=lambda x: x[1], reverse=True)
-                    for sym, score, side, mode, p, det in results[:3]: 
-                        asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, self.market_data_cache))
+                    for sym, score, side, mode, p, det in results[:3]:
+                        task = asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, self.market_data_cache))
+                        self._background_tasks.add(task); task.add_done_callback(self._on_bg_task_done)
                 
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 
+            except asyncio.CancelledError:
+                raise
             except Exception as loop_e:
                 # [P0-5a FIX] Removed duplicate except block (dead code — second
                 # handler was never reachable and shadowed the first).
                 logging.critical(f"💥 CRITICAL SCANNER LOOP ERROR: {loop_e}")
                 await asyncio.sleep(1.0) # Prevent CPU spin on persistent error
+        finally:
+            mm.close()
+            os.close(fd)
 
 if __name__ == "__main__":
-    import logging
     from logging.handlers import RotatingFileHandler
     
     log_file = os.path.join(BASE_DIR, "logs/sovereign_v43.log")
@@ -327,5 +383,4 @@ if __name__ == "__main__":
         asyncio.run(engine.start())
     except Exception as e:
         logging.critical(f"💥 CRITICAL BOOT FAILURE: {e}")
-        import traceback
         logging.error(traceback.format_exc())

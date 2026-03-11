@@ -53,6 +53,11 @@ string g_shm_path = "/dev/shm/shark_shm_v60";
 atomic<bool> g_reload_config{false};
 atomic<bool> g_engine_running{true}; // [P0-2 FIX] single long-lived flag for pulse thread
 
+// Network Mode
+bool g_testnet = false;
+string g_rest_host = "fapi.binance.com";
+string g_ws_host = "fstream.binance.com";
+
 // Configurable Constants (Defaults)
 double g_score_threshold = 245.0;
 double g_vwap_entry_short = 2.7;
@@ -67,6 +72,20 @@ int g_ws_batch_size = 20;
 std::mutex g_map_mutex;
 
 void load_constants(simdjson::dom::element cfg) {
+    // Read testnet flag from system section
+    simdjson::dom::element sys;
+    if (cfg["system"].get(sys) == simdjson::SUCCESS) {
+        bool tn; if (sys["testnet"].get(tn) == simdjson::SUCCESS) g_testnet = tn;
+    }
+    if (g_testnet) {
+        g_rest_host = "testnet.binancefuture.com";
+        g_ws_host = "stream.binancefuture.com";
+        printf("🧪 TESTNET MODE ACTIVE\n");
+    } else {
+        g_rest_host = "fapi.binance.com";
+        g_ws_host = "fstream.binance.com";
+    }
+
     simdjson::dom::element c;
     if (cfg["constants"].get(c) == simdjson::SUCCESS) {
         string_view shm; if (c["SHM_PATH"].get(shm) == simdjson::SUCCESS) g_shm_path = string(shm);
@@ -79,8 +98,8 @@ void load_constants(simdjson::dom::element cfg) {
         c["DEPTH_RATIO_SMOOTH"].get(g_depth_ratio_smooth);
         c["ACC_EMA_SMOOTH"].get(g_acc_ema_smooth);
         int64_t b_sz; if (c["WS_BATCH_SIZE"].get(b_sz) == simdjson::SUCCESS) g_ws_batch_size = (int)b_sz;
-        
-        printf("⚙️ Constants Loaded: SHM=%s, TH=%0.1f, Win=%dms, Depth=%d, Batch=%d\n", 
+
+        printf("⚙️ Constants Loaded: SHM=%s, TH=%0.1f, Win=%dms, Depth=%d, Batch=%d\n",
                g_shm_path.c_str(), g_score_threshold, g_cvd_window_ms, g_depth_levels, g_ws_batch_size);
     }
 }
@@ -233,7 +252,7 @@ public:
         auto fetch_candles_raw = [&](const string& interval, int limit) -> string {
             if (!is_active) return "";
             string target = "/fapi/v1/klines?symbol=" + symbol + "&interval=" + interval + "&limit=" + to_string(limit);
-            return http_get_sync("fapi.binance.com", target);
+            return http_get_sync(g_rest_host, target);
         };
 
         string b1 = fetch_candles_raw("1m", 500);
@@ -575,7 +594,7 @@ int main(int argc, char** argv) {
                 string s = engines[j]->symbol; string ls = s; for(auto &c : ls) c = tolower(c);
                 batch_path += (j == i ? "" : "/") + ls + "@trade/" + ls + "@depth10@100ms";
             }
-            make_shared<session>(ioc, ctx)->run("fstream.binance.com", batch_path);
+            make_shared<session>(ioc, ctx)->run(g_ws_host.c_str(), batch_path);
         }
         printf("🔓 IO Loop Started. Active: %d Symbols.\n", idx);
         fflush(stdout);

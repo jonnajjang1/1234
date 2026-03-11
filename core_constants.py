@@ -1,7 +1,7 @@
 import json
 import os
 
-BASE_DIR = "/home/ninano990707/shark_system"
+BASE_DIR = os.environ.get('SHARK_BASE_DIR', os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "shark_config.json")
 
 def load_full_config():
@@ -15,8 +15,46 @@ def load_full_config():
 
 # Single Source of Truth
 CONFIG = load_full_config()
+
+def _validate_config(cfg):
+    """Warn on invalid config values. Does not crash — graceful degradation."""
+    import logging
+    _c = cfg.get('constants', {})
+    _s = cfg.get('system', {})
+    checks = [
+        ('DEFAULT_LEVERAGE', _s, 1, 125, 10),
+        ('HARD_STOP_LOSS_NET', _c, -1.0, 0, -0.055),
+        ('FEE_RATE_TOTAL', _c, 0, 0.01, 0.0012),
+        ('GRACE_PERIOD_SEC', _c, 0, 3600, 300),
+    ]
+    for key, section, lo, hi, default in checks:
+        try:
+            val = float(section.get(key, default))
+            if not (lo <= val <= hi):
+                logging.warning(f"Config '{key}' = {val} out of range [{lo}, {hi}]. Using default {default}.")
+                section[key] = default
+        except (TypeError, ValueError):
+            logging.warning(f"Config '{key}' is not numeric. Using default {default}.")
+            section[key] = default
+
+_validate_config(CONFIG)
 _c = CONFIG.get('constants', {})
 _s = CONFIG.get('system', {})
+
+# --- NETWORK MODE ---
+TESTNET = bool(_s.get('testnet', False))
+
+# Binance Futures endpoints
+if TESTNET:
+    FAPI_REST_BASE = "https://testnet.binancefuture.com"
+    FAPI_WS_BASE = "wss://stream.binancefuture.com"
+    FAPI_WS_HOST = "stream.binancefuture.com"
+    FAPI_REST_HOST = "testnet.binancefuture.com"
+else:
+    FAPI_REST_BASE = "https://fapi.binance.com"
+    FAPI_WS_BASE = "wss://fstream.binance.com"
+    FAPI_WS_HOST = "fstream.binance.com"
+    FAPI_REST_HOST = "fapi.binance.com"
 
 # --- SYSTEM METADATA ---
 SYSTEM_VERSION = _s.get('VERSION', "V58.0-HYPERNOVA")
@@ -118,3 +156,9 @@ OI_DECOUPLE_SCALE = _c.get('OI_DECOUPLE_SCALE', 50.0)
 OI_DECOUPLE_CAP = _c.get('OI_DECOUPLE_CAP', 1.5)
 OI_DECOUPLE_WINDOW = int(_c.get('OI_DECOUPLE_WINDOW', 6))
 OI_DECOUPLE_INTERVAL = _c.get('OI_DECOUPLE_INTERVAL', 5.0)
+
+# --- LIVE TRADING ---
+_live_raw = _s.get('live_trading', False)
+LIVE_TRADING = _live_raw is True  # Strict: only JSON `true` enables live trading
+BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET', '')
+MAX_CAPITAL = float(_s.get('max_capital', 1000.0))

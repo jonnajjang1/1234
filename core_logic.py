@@ -96,8 +96,8 @@ class StrategyLogic:
         if m['rsi5'] == 0: return 0.0, "WARMUP", "NONE", "NONE", {}
         
         # [V61.3 FIX] Apply Macro Noise Filtering: Subtract market median VWAP
-        m['vwap_raw'] = m['vwap'] # Backup original for debugging/logging
-        m['vwap'] = m['vwap'] - StrategyLogic.market_median_vwap
+        m['vwap_raw'] = m['vwap']
+        m['vwap'] = max(-5.0, min(5.0, m['vwap'] - StrategyLogic.market_median_vwap))
         
         # [V61.0] Apply Regime Scaling
         # [P0-5b FIX] Removed duplicate block (copy-paste artifact).
@@ -111,8 +111,6 @@ class StrategyLogic:
         
         # [V60.4] VWAP Acceleration
         last_vwap_z = hist.get('last_vwap_z', 0.0); vwap_vel = abs(m['vwap']) - abs(last_vwap_z); hist['last_vwap_z'] = m['vwap']
-        last_vwap_vel = hist.get('last_vwap_vel', 0.0); m['vwap_acc'] = vwap_vel - last_vwap_vel; hist['last_vwap_vel'] = vwap_vel
-        
         # --- OI DECOUPLING SNAPSHOTS (V58.0 Patch) ---
         now_ts = time.time()
         if not hist['oi_snapshots'] or (now_ts - hist['oi_snapshots'][-1][0] >= OI_DECOUPLE_INTERVAL):
@@ -162,7 +160,10 @@ class StrategyLogic:
             
         is_p_s, is_p_l = StrategyLogic._check_parabolic_state(m)
         mode, side, dtd_eff = StrategyLogic._determine_master_mode(m, l_rank, s_rank, oi_rank, is_p_s or is_p_l, rm['vwap_gate_mult'])
-        sc_s, sc_l = StrategyLogic._calculate_scores(m, nexus, rsi_delta, vwap_vel, squeeze_bonus)
+        if mode == "WHALE-FORCE":
+            sc_s, sc_l = StrategyLogic._calculate_whale_score(m, side)
+        else:
+            sc_s, sc_l = StrategyLogic._calculate_scores(m, nexus, rsi_delta, squeeze_bonus)
         
         # --- OI DECOUPLING LOGIC (Physics-based Distribution Check) ---
         decoupling_boost_s = 1.0
@@ -189,11 +190,13 @@ class StrategyLogic:
         # --- V58.0 SYNERGY COUNT (Removed acc_z, added absorption) ---
         syn_count = 0
         if m['absorption_power'] > ABSORPTION_SYNERGY_LIMIT: syn_count += 1
-        if abs(m['oi_z']) > SYNERGY_OI_LIMIT: syn_count += 1
+        if m['oi_z'] > SYNERGY_OI_LIMIT: syn_count += 1
         if abs(m['vwap']) > 2.0: syn_count += 1
         
         synergy_mult = 1.0 if syn_count < 2 else min(SYNERGY_MULT_MAX, SYNERGY_MULT_BASE * (1.15 ** (syn_count - 2)))
-        sc_s *= synergy_mult; sc_l *= synergy_mult
+        if side == "SHORT": sc_s *= synergy_mult
+        elif side == "LONG": sc_l *= synergy_mult
+        else: sc_s *= synergy_mult; sc_l *= synergy_mult
         
         sc_s = StrategyLogic._apply_bonuses(sc_s, "SHORT", m, s_rank, oi_rank, mode)
         sc_l = StrategyLogic._apply_bonuses(sc_l, "LONG", m, l_rank, oi_rank, mode)
@@ -220,7 +223,7 @@ class StrategyLogic:
             'fric': m['fric'],
             's_score': f_score, 
             'th': scaled_th,
-            'mode': mode, 'ver': "V61.0", 'syn': syn_count,
+            'mode': mode, 'ver': "V62.0", 'syn': syn_count,
             'rsi_delta': rsi_delta, 'vwap_vel': vwap_vel,
             'oi_raw': m['oi_raw'], 'squeeze': squeeze_bonus,
             'liq_ratio': m['liq_ratio'], 'abs_vel': m['abs_vel'],
@@ -258,9 +261,6 @@ class StrategyLogic:
 
     @staticmethod
     def _determine_master_mode(m, l_rk, s_rk, oi_rk, is_insane, vg_mult=1.0) -> Tuple[str, str, float]:
-        is_turn_up = (m['vwap_raw'] < -1.5 and m['vel'] > 0.2 and m['cvd_z'] > 0.5)
-        is_turn_down = (m['vwap_raw'] > 1.5 and m['vel'] < -0.2 and m['cvd_z'] < -0.5)
-        # [V61.5 FIX] Bias must use vwap_raw to avoid distortion from Macro Noise Filter (Beta Neutralization)
         bias = "UP" if m['vwap_raw'] > 0 else "DOWN"
         mode, side = "NONE", "NONE"; dtd = abs(m['vwap']) / (abs(m['cvd_z']) + DTD_EPSILON); dtd_eff = math.tanh(dtd)
         is_whale = (oi_rk <= OI_RANK_LIMIT); is_rsi_ext = (m['rsi5'] > 75 or m['rsi5'] < 25); is_elastic = m.get('is_recoiling') or m.get('is_absorbed')
@@ -273,19 +273,22 @@ class StrategyLogic:
             mode = "APEX-REVERSAL"; side = "SHORT" if bias == "UP" else "LONG"
         elif is_whale:
             abs_pwr = m.get('absorption_power', 0.0)
-            # [V60.2 FIX] Relaxed Whale Entry (oi_z 2.0 -> 0.5) to catch trends
-            if abs(m['l_liq_z']) > WHALE_LIQ_Z_THRESHOLD or abs(m['s_liq_z']) > WHALE_LIQ_Z_THRESHOLD or (abs_pwr > 1.0 and m['oi_z'] > 0.5):
-                 if m['oi_z'] > 0.2:
-                     # [V61.2 FIX] WHALE-FORCE dead-zone mitigation
-                     if abs(m['cvd_z']) >= 0.3:
-                         mode = "WHALE-FORCE"; side = "LONG" if m['cvd_z'] > 0 else "SHORT" 
+            liq_triggered = abs(m['l_liq_z']) > WHALE_LIQ_Z_THRESHOLD or abs(m['s_liq_z']) > WHALE_LIQ_Z_THRESHOLD
+            abs_triggered = abs_pwr > 1.0 and m['oi_z'] > 0.5
+            if liq_triggered or abs_triggered:
+                 if m['oi_z'] > WHALE_MIN_OI_Z_FORCE and abs(m['cvd_z']) >= 0.3:
+                     mode = "WHALE-FORCE"
+                     if liq_triggered:
+                         side = "LONG" if m['s_liq_z'] > m['l_liq_z'] else "SHORT"
+                     else:
+                         side = "LONG" if m['cvd_z'] > 0 else "SHORT"
         return mode, side, dtd_eff
 
     @staticmethod
     def _extract_metrics(data: dict, intel) -> dict:
         def sv(v, d=0.0):
             try: return float(v) if math.isfinite(float(v)) else d
-            except: return d
+            except Exception: return d
         # [P3-3] Readability: split the one-liner return into aligned multi-line dict.
         return {
             'dr':      sv(data.get('depth_ratio', 0)),
@@ -297,7 +300,7 @@ class StrategyLogic:
             'vel':     sv(data.get('cvd_vel', 0)),
             'cvd_z':   sv(data.get('cvd_z', 0)),
             'acc_z':   sv(data.get('acc_z', 0)),
-            'vwap':    max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0)))),
+            'vwap':    sv(data.get('vwap_z', 0.0)),
             'eff':     sv(data.get('eff_z', 0)),
             'cp':      sv(data.get('cp', 0)),
             'oi_z':    sv(data.get('oi_z', 0.0)),
@@ -333,19 +336,23 @@ class StrategyLogic:
         if not (is_p_s or is_p_l or climax or mode == "WHALE-FORCE"):
             if side == "LONG" and not (m['rsi5'] < 55 and m['rsi15'] < 60): return "MTF_DISALIGN_L"
             if side == "SHORT" and not (m['rsi5'] > 45 and m['rsi15'] > 40): return "MTF_DISALIGN_S"
-        if mode == "WHALE-FORCE" and m['oi_z'] < 0.2: return "OI_OUTFLOW_VETO"
+        if mode == "WHALE-FORCE" and m['oi_z'] < WHALE_MIN_OI_Z_FORCE: return "OI_OUTFLOW_VETO"
         # [V61.1 FIX] Mitigate OI_TOO_WEAK block during 429 stale periods. High scores bypass this.
         if abs(m['oi_z']) < 0.5 and not climax and mode == "NONE" and m.get('s_score', 0) < 200.0: return "OI_TOO_WEAK" 
         return None
 
     @staticmethod
-    def _calculate_scores(m: dict, nexus: dict, rsi_delta: float, vwap_vel: float, squeeze_bonus: float) -> Tuple[float, float]:
+    def _calculate_scores(m: dict, nexus: dict, rsi_delta: float, squeeze_bonus: float) -> Tuple[float, float]:
         dr_p = (math.tanh(m['dr'] * 2.0) * 15.0) * nexus['w_integrity']
         ke_s, ke_l = m['vwap'] * 40.0, -m['vwap'] * 40.0
         rsi_h = {'s': max(0.0, m['rsi5'] - 65.0) * 18.0, 'l': max(0.0, 35.0 - m['rsi5']) * 18.0}
         abs_bonus = min(25.0, m['abs_sc'] * 6.0) if m['abs_sc'] > 0.8 else 0.0
+        abs_bonus_s = abs_bonus if m['vwap'] > 0 else 0.0
+        abs_bonus_l = abs_bonus if m['vwap'] < 0 else 0.0
         impulse_s = max(0.0, -rsi_delta * 2.0); impulse_l = max(0.0, rsi_delta * 2.0)
-        
+        squeeze_s = squeeze_bonus if m['vwap'] > 0 else 0.0
+        squeeze_l = squeeze_bonus if m['vwap'] < 0 else 0.0
+
         # --- V58.0 UNIFIED ABSORPTION CONTRIBUTION ---
         abs_pwr = m.get('absorption_power', 0.0)
         if abs_pwr > 0.5 and abs(m['vwap']) > ABSORPTION_VWAP_GATE:
@@ -353,22 +360,19 @@ class StrategyLogic:
             raw_abs_score = abs_pwr * ABSORPTION_SCORE_SCALE * vwap_intensity
             abs_contribution = min(ABSORPTION_SCORE_CAP, raw_abs_score)
         else: abs_contribution = 0.0
-        
+
         recoil = 30.0 if m.get('is_recoiling') else 0.0
         abs_s = (abs_contribution + recoil) if m['vwap'] > 0 else 0.0
         abs_l = (abs_contribution + recoil) if m['vwap'] < 0 else 0.0
-        
+
         # [V60.4] Absorption Velocity Bonus
-        # If wall is growing (abs_vel > 0), increase confidence. If collapsing, reduce.
         abs_vel_bonus = max(-20.0, min(20.0, m['abs_vel'] * 10.0))
-        
-        # [V60.5 FIX] Derive direction from VWAP (side is not available here)
-        if m['vwap'] > 0: abs_s += abs_vel_bonus # Price High -> Wall supports Short Reversal
-        elif m['vwap'] < 0: abs_l += abs_vel_bonus # Price Low -> Wall supports Long Reversal
-        
-        # Base Assembly (No Divergence)
-        base_s = (ke_s + rsi_h['s'] - dr_p + abs_bonus + impulse_s + abs_s + squeeze_bonus)
-        base_l = (ke_l + rsi_h['l'] + dr_p + abs_bonus + impulse_l + abs_l + squeeze_bonus)
+        if m['vwap'] > 0: abs_s += abs_vel_bonus
+        elif m['vwap'] < 0: abs_l += abs_vel_bonus
+
+        # Base Assembly — directional bonuses applied to reversal side only
+        base_s = (ke_s + rsi_h['s'] - dr_p + abs_bonus_s + impulse_s + abs_s + squeeze_s)
+        base_l = (ke_l + rsi_h['l'] + dr_p + abs_bonus_l + impulse_l + abs_l + squeeze_l)
         
         # [V60.4] Liquidation Asymmetry Ratio Multiplier (Continuous)
         liq_mult_s = 1.0 + max(0.0, m['liq_ratio'] * 0.5) 
@@ -403,7 +407,29 @@ class StrategyLogic:
             nfe_s, nfe_l = (eff_s / (abs(m['vel']) + 0.01)) * 100.0, (eff_l / (abs(m['vel']) + 0.01)) * 100.0
             p_boost = math.exp(min(NFE_BOOST_CAP, abs(m['vwap']) / NFE_BOOST_SCALING))
             return nfe_l * p_boost, nfe_s * p_boost
-        except: return 0.0, 0.0
+        except Exception as e:
+            logging.debug(f"NFE calc failed [{sym}]: {e}")
+            return 0.0, 0.0
+
+    @staticmethod
+    def _calculate_whale_score(m: dict, side: str) -> Tuple[float, float]:
+        """Trend-following scoring for WHALE-FORCE. Rewards fuel, cascade, flow alignment."""
+        oi_s = min(200.0, max(0.0, m['oi_z']) * 80.0)
+        if side == "LONG":
+            liq_s = min(150.0, max(0.0, m['s_liq_z']) * 40.0)
+            cvd_s = min(100.0, max(0.0, m['cvd_z']) * 50.0)
+            vel_s = min(60.0, max(0.0, m['vel']) * 60.0)
+        else:
+            liq_s = min(150.0, max(0.0, m['l_liq_z']) * 40.0)
+            cvd_s = min(100.0, max(0.0, -m['cvd_z']) * 50.0)
+            vel_s = min(60.0, max(0.0, -m['vel']) * 60.0)
+        abs_pwr = m.get('absorption_power', 0.0)
+        abs_s = min(50.0, abs_pwr * 20.0) if abs_pwr > 0.5 else 0.0
+        total = oi_s + liq_s + cvd_s + vel_s + abs_s
+        if side == "SHORT":
+            return max(0.1, total), 0.1
+        else:
+            return 0.1, max(0.1, total)
 
     @staticmethod
     def update_matrices_only(symbol: str, data: dict) -> Tuple[float, float]:
@@ -416,10 +442,10 @@ class StrategyLogic:
         """
         def sv(v, d=0.0):
             try: return float(v) if math.isfinite(float(v)) else d
-            except: return d
+            except Exception: return d
         vel   = sv(data.get('cvd_vel', 0))
         cvd_z = sv(data.get('cvd_z', 0))
-        vwap  = max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0))))
+        vwap  = max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0)) - StrategyLogic.market_median_vwap))
         oi_z  = sv(data.get('oi_z', 0.0))
         nfe_l, nfe_s = 0.0, 0.0
         if abs(vel) >= 0.05:
@@ -429,7 +455,8 @@ class StrategyLogic:
                 p_boost = math.exp(min(NFE_BOOST_CAP, abs(vwap) / NFE_BOOST_SCALING))
                 nfe_s   = (eff_s / (abs(vel) + 0.01)) * 100.0 * p_boost
                 nfe_l   = (eff_l / (abs(vel) + 0.01)) * 100.0 * p_boost
-            except: pass
+            except Exception as e:
+                logging.debug(f"NFE matrix update failed [{symbol}]: {e}")
         StrategyLogic.nfe_matrix_long[symbol]  = nfe_l
         StrategyLogic.nfe_matrix_short[symbol] = nfe_s
         StrategyLogic.oi_matrix[symbol]        = max(0.0, oi_z)
@@ -443,9 +470,9 @@ class StrategyLogic:
                 # [P1-1] Running sums for O(1) averaging in _apply_persistence.
                 # Initial value is 0.0 because the deques start filled with 0.0.
                 'sum_s': 0.0, 'sum_l': 0.0,
-                'abs_streak': deque(maxlen=5), 'wall_window': deque(maxlen=3), 'oi_snapshots': deque(maxlen=12),
+                'wall_window': deque(maxlen=3), 'oi_snapshots': deque(maxlen=12),
                 'last_rsi': 50.0, 'last_vwap_z': 0.0, 'last_price': 0.0, 'last_oi': 0.0,
-                'last_abs': 0.0, 'last_vwap_vel': 0.0
+                'last_abs': 0.0
             }
         return StrategyLogic.persistence_history[symbol]
 
@@ -466,14 +493,11 @@ class StrategyLogic:
 
     @staticmethod
     def _calculate_nexus_metrics(hist: dict, m: dict) -> dict:
-        now = time.time(); is_abs = (m['abs'] > 2.2 and m.get('absorption_power', 0) > 2.0)
-        if is_abs: hist['abs_streak'].append(now)
-        while hist['abs_streak'] and now - hist['abs_streak'][0] > 60: hist['abs_streak'].popleft()
         dr_p = (math.tanh(m['dr'] * 2.5) * 15.0); hist['wall_window'].append(dr_p); w_int = 1.0
         if len(hist['wall_window']) == 3 and abs(dr_p) > 2.5:
             mean = sum(hist['wall_window'])/3; std = math.sqrt(sum((x-mean)**2 for x in hist['wall_window'])/3)
             if std < (abs(dr_p) * 0.25): w_int = 1.25
-        return {'f_locked': len(hist['abs_streak']) >= 3, 'w_integrity': w_int}
+        return {'w_integrity': w_int}
 
     @staticmethod
     def run_memory_gc(active_symbols: set):

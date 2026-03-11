@@ -8,11 +8,12 @@ import math
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 from core_constants import *
-
-BASE_DIR = "/home/ninano990707/shark_system"
+from order_executor import OrderExecutor, PaperExecutor
 
 class SharkTrader:
-    def __init__(self, config: dict):
+    LOCK_TIMEOUT = 10.0  # seconds — prevents deadlock on asyncio.Lock
+
+    def __init__(self, config: dict, executor: OrderExecutor = None):
         self.sys_cfg = config.get('system', {})
         self.tg_cfg = config.get('telegram', {})
         self.db_path = os.path.join(BASE_DIR, "logs/shark_vault.db")
@@ -23,44 +24,85 @@ class SharkTrader:
         self.positions = {}
         self.wallet = {"balance": 10000.0}
         self.session = None
-        self.loss_streak = {} 
+        self.loss_streak = {}
+        self._background_tasks: set = set()
         self.db_queue = asyncio.Queue()
         self._init_db()
         self._load_state_from_db()
-        self.db_worker_task = asyncio.create_task(self._db_writer_worker())
+        self.executor = executor or PaperExecutor(self.wallet)
+        self.db_worker_task = None  # Lazy: started by start_db_worker()
+
+    def start_db_worker(self):
+        """Start DB writer task. Must be called from an async context (running event loop)."""
+        if self.db_worker_task is None or self.db_worker_task.done():
+            self.db_worker_task = asyncio.create_task(self._db_writer_worker())
 
     def stop(self):
-        if hasattr(self, 'db_worker_task') and self.db_worker_task:
+        if self.db_worker_task and not self.db_worker_task.done():
             self.db_worker_task.cancel()
+
+    async def _acquire_lock(self, context="unknown"):
+        """Acquire self.lock with timeout. Returns True on success, False on timeout."""
+        try:
+            await asyncio.wait_for(self.lock.acquire(), timeout=self.LOCK_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            logging.critical(f"LOCK TIMEOUT in {context} after {self.LOCK_TIMEOUT}s — skipping operation")
+            return False
+
+    def _spawn_task(self, coro):
+        """Track fire-and-forget tasks so exceptions don't vanish silently."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task):
+        self._background_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logging.error(f"[BackgroundTask] Failed: {task.exception()}")
 
     async def _db_writer_worker(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        while True:
-            future = None
-            try:
-                task = await self.db_queue.get()
-                if len(task) == 3:
-                    func, args, future = task
-                else:
-                    func, args = task
-                
-                func(conn, *args); conn.commit()
-                if future and not future.done(): future.set_result(True)
-                self.db_queue.task_done()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logging.error(f"❌ [DB_WORKER] Write Failed: {e}")
-                if future and not future.done(): future.set_exception(e)
-                self.db_queue.task_done()
-                await asyncio.sleep(1)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            while True:
+                future = None
+                try:
+                    task = await self.db_queue.get()
+                    if len(task) == 3:
+                        func, args, future = task
+                    else:
+                        func, args = task
+
+                    func(conn, *args); conn.commit()
+                    if future and not future.done(): future.set_result(True)
+                    self.db_queue.task_done()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.error(f"❌ [DB_WORKER] Write Failed: {e}")
+                    if future and not future.done(): future.set_exception(e)
+                    self.db_queue.task_done()
+                    await asyncio.sleep(1)
+        finally:
+            conn.close()
+
+    async def _ensure_db_worker(self):
+        """Auto-start or restart DB worker if needed."""
+        if self.db_worker_task is None or self.db_worker_task.done():
+            if self.db_worker_task and self.db_worker_task.done():
+                exc = self.db_worker_task.exception() if not self.db_worker_task.cancelled() else None
+                logging.error(f"DB worker died ({exc}). Restarting...")
+            self.db_worker_task = asyncio.create_task(self._db_writer_worker())
 
     async def _execute_db_task(self, func, *args):
+        await self._ensure_db_worker()
         await self.db_queue.put((func, args))
 
     async def _execute_db_task_with_confirm(self, func, done_event, *args):
+        await self._ensure_db_worker()
         await self.db_queue.put((func, args, done_event))
 
     def _init_db(self):
@@ -92,13 +134,15 @@ class SharkTrader:
             cb_rows = conn.execute("SELECT * FROM circuit_breaker").fetchall()
             self.loss_streak = {r['symbol']: {'count': r['count'], 'last_time': r['last_time']} for r in cb_rows}
 
-    async def bootstrap(self): pass
-
     async def update_pnl(self, market_data: dict, intel, current_time: float) -> Tuple[None, None, List]:
         exit_list = []
         updates = []
-        async with self.lock:
+        if not await self._acquire_lock("update_pnl"):
+            return None, None, exit_list
+        try:
             pos_snapshot = list(self.positions.items())
+        finally:
+            self.lock.release()
         for i, (sym, pos) in enumerate(pos_snapshot):
             if i > 0 and i % 10 == 0: await asyncio.sleep(0)
             if pos.get('is_closing'): continue
@@ -132,6 +176,11 @@ class SharkTrader:
             if reason: exit_list.append((sym, curr_p, reason))
             elif is_new_peak: updates.append((sym, pos['details']))
         for sym, det in updates: await self._execute_db_task(self._db_update_details, sym, json.dumps(det))
+        # Orphan recovery: if is_closing stuck for >30s, release the lock
+        for sym, pos in pos_snapshot:
+            if pos.get('is_closing') and (current_time - pos.get('close_attempt_time', 0)) > 30:
+                pos['is_closing'] = False
+                logging.warning(f"Recovered orphaned position: {sym}")
         return None, None, exit_list
 
     def _db_update_details(self, conn, sym, det_json):
@@ -225,7 +274,9 @@ class SharkTrader:
         return float(math.floor(qty / step) * step) if step > 0 else round(qty, 1)
 
     async def open_position(self, symbol, side, score, rank, mode, price, intel, details, market_data=None):
-        async with self.lock:
+        if not await self._acquire_lock("open_position"):
+            return False
+        try:
             if not self._can_open(symbol): return False
 
             # --- IRONSHIELD: REAL GLOBAL PNL INTEGRITY CHECK (V58.0 Patch) ---
@@ -243,68 +294,134 @@ class SharkTrader:
             margin = self.wallet['balance'] * self.margin_ratio * conf
             qty = self._format_qty(symbol, (margin * DEFAULT_LEVERAGE) / price, intel)
             if qty <= 0: return False
-            pos = {'entry': price, 'type': side, 'qty': qty, 'entry_margin': margin, 'lev': DEFAULT_LEVERAGE, 'start_time': time.time(), 'details': {**details, "max_price": price}}
+
+            # --- EXECUTOR: Place order on exchange (paper or live) ---
+            result = await self.executor.open_order(symbol, side, qty, DEFAULT_LEVERAGE)
+            if not result.success:
+                logging.warning(f"[Executor] Open order failed: {symbol} {result.error_msg}")
+                return False
+
+            fill_price = result.avg_price if result.avg_price > 0 else price
+            fill_qty = result.executed_qty if result.executed_qty > 0 else qty
+
+            pos = {'entry': fill_price, 'type': side, 'qty': fill_qty, 'entry_margin': margin, 'lev': DEFAULT_LEVERAGE, 'start_time': time.time(), 'details': {**details, "max_price": fill_price}}
             self.positions[symbol] = pos
 
             # [V61.5 FIX] DB task must be queued INSIDE lock to prevent race with close_position
-            # We don't await the confirmation here to keep entry fast, but order is now guaranteed.
-            asyncio.create_task(self._execute_db_task(self._db_add_pos, symbol, price, side, qty, margin, DEFAULT_LEVERAGE, pos['details']))
+            self._spawn_task(self._execute_db_task(self._db_add_pos, symbol, fill_price, side, fill_qty, margin, DEFAULT_LEVERAGE, pos['details']))
 
-            self._notify_open(symbol, side, price, score, mode, details)
+            self._notify_open(symbol, side, fill_price, score, mode, details)
             return True
+        finally:
+            self.lock.release()
     def _db_add_pos(self, conn, sym, p, s, q, m, lev, det):
         conn.execute("INSERT OR REPLACE INTO active_positions VALUES (?,?,?,?,?,?,?,?,?)", (sym, p, s, q, m, 0.0, time.time(), json.dumps(det), lev))
 
     async def close_position(self, symbol, exit_price, reason, snapshot=None):
         # 1. PRE-CHECK & LOCKING
-        async with self.lock:
+        if not await self._acquire_lock("close_position"):
+            return
+        try:
             if symbol not in self.positions: return
             pos = self.positions[symbol]
-            if pos.get('is_closing'): return 
+            if pos.get('is_closing'): return
             pos['is_closing'] = True
-            
-            net_pnl = self._calculate_net_pnl(pos, exit_price)
-            pnl_usd = pos['entry_margin'] * net_pnl
-            
-            # --- IRONSHIELD: ANOMALY PNL PROTECTION ---
-            if abs(pnl_usd) > 5000.0:
-                logging.critical(f"🚨 [IronShield] ANOMALY DETECTED: {symbol} PnL ${pnl_usd:.2f}!")
+            pos['close_attempt_time'] = time.time()
+        finally:
+            self.lock.release()
 
-            # [V60.3 FIX] Transactional Integrity: DB First, Memory Second
-            future = asyncio.Future()
-            # Pass pnl_usd instead of calculated new_balance to ensure atomic update
-            await self._execute_db_task_with_confirm(self._db_close_pos, future, symbol, exit_price, net_pnl, pnl_usd, reason, pos)
-            
-        try:
-            # 2. DB WAIT (LOCK RELEASED)
-            await asyncio.wait_for(future, timeout=5.0)
-            
-            # 3. FINALIZATION (RE-LOCK)
-            async with self.lock:
-                if symbol not in self.positions: return
-                
-                # SUCCESS: Apply atomic increment to balance
-                self.wallet['balance'] += pnl_usd
-                
-                if net_pnl < LOSS_STREAK_THRESHOLD: 
-                    self.loss_streak[symbol] = {'count': self.loss_streak.get(symbol, {}).get('count', 0) + 1, 'last_time': time.time()}
-                else: 
-                    self.loss_streak[symbol] = {'count': 0, 'last_time': 0}
-                
-                self._notify_close(symbol, pos, exit_price, net_pnl, pnl_usd, reason)
-                del self.positions[symbol]
-                
-        except Exception as e:
-            logging.error(f"❌ [DB] Close failed for {symbol}: {e}. State retained.")
-            async with self.lock:
+        # 2. EXECUTOR: Place close order on exchange (lock released for async call)
+        result = await self.executor.close_order(symbol, pos['type'], pos['qty'])
+        if not result.success:
+            logging.error(f"[Executor] Close order failed: {symbol} {result.error_msg}")
+            if not await self._acquire_lock("close_position_exec_fail"):
+                return
+            try:
                 if symbol in self.positions: self.positions[symbol]['is_closing'] = False
+            finally:
+                self.lock.release()
+            return
+
+        # 3. PNL CALCULATION (actual fill price from exchange)
+        actual_exit = result.avg_price if result.avg_price > 0 else exit_price
+        net_pnl = self._calculate_net_pnl(pos, actual_exit)
+        pnl_usd = pos['entry_margin'] * net_pnl
+
+        # --- IRONSHIELD: ANOMALY PNL PROTECTION ---
+        if abs(pnl_usd) > 5000.0:
+            logging.critical(f"🚨 [IronShield] ANOMALY DETECTED: {symbol} PnL ${pnl_usd:.2f}!")
+
+        # 4. DB WRITE (RE-LOCK)
+        # Critical: exchange has already filled. Lock failure must NOT leave position orphaned.
+        if not await self._acquire_lock("close_position_db"):
+            logging.critical(f"[CRITICAL] Lock timeout after exchange fill for {symbol}. Scheduling forced cleanup.")
+            self._schedule_forced_cleanup(symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
+            return
+        try:
+            if symbol not in self.positions:
+                return
+            future = asyncio.Future()
+            await self._execute_db_task_with_confirm(self._db_close_pos, future, symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
+        finally:
+            self.lock.release()
+
+        try:
+            # 5. DB WAIT (LOCK RELEASED)
+            await asyncio.wait_for(future, timeout=5.0)
+
+            # 6. FINALIZATION (RE-LOCK)
+            if not await self._acquire_lock("close_position_finalize"):
+                logging.critical(f"[CRITICAL] Lock timeout at finalize for {symbol}. Scheduling forced cleanup.")
+                self._schedule_forced_cleanup(symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
+                return
+            try:
+                if symbol not in self.positions:
+                    return
+
+                self.wallet['balance'] += pnl_usd
+
+                if net_pnl < LOSS_STREAK_THRESHOLD:
+                    self.loss_streak[symbol] = {'count': self.loss_streak.get(symbol, {}).get('count', 0) + 1, 'last_time': time.time()}
+                else:
+                    self.loss_streak[symbol] = {'count': 0, 'last_time': 0}
+
+                self._notify_close(symbol, pos, actual_exit, net_pnl, pnl_usd, reason)
+                del self.positions[symbol]
+            finally:
+                self.lock.release()
+
+        except Exception as e:
+            logging.error(f"[DB] Close failed for {symbol}: {e}. Scheduling forced cleanup.")
+            self._schedule_forced_cleanup(symbol, actual_exit, net_pnl, pnl_usd, reason, pos)
+
+    def _schedule_forced_cleanup(self, symbol, exit_price, net_pnl, pnl_usd, reason, pos):
+        """Emergency cleanup after exchange fill when lock/DB fails. Retries until state is consistent."""
+        async def _force_cleanup():
+            for attempt in range(5):
+                await asyncio.sleep(2 ** attempt)
+                if not await self._acquire_lock("forced_cleanup"):
+                    continue
+                try:
+                    if symbol not in self.positions:
+                        return  # Already cleaned up (e.g. by reconcile)
+                    self.wallet['balance'] += pnl_usd
+                    del self.positions[symbol]
+                    await self._execute_db_task(self._db_close_pos, symbol, exit_price, net_pnl, pnl_usd, reason, pos)
+                    logging.warning(f"[ForcedCleanup] Successfully cleaned up {symbol} on attempt {attempt + 1}")
+                    return
+                except Exception as e:
+                    logging.error(f"[ForcedCleanup] Attempt {attempt + 1} failed for {symbol}: {e}")
+                finally:
+                    self.lock.release()
+            logging.critical(f"[ForcedCleanup] FAILED after 5 attempts for {symbol}. Manual intervention required.")
+        self._spawn_task(_force_cleanup())
 
     def _db_close_pos(self, conn, sym, ex_p, n_p, p_usd, reas, pos):
         conn.execute("DELETE FROM active_positions WHERE symbol=?", (sym,))
         # Use atomic increment in SQL to prevent race conditions
         conn.execute("UPDATE wallet SET balance = balance + ?, last_update=datetime('now') WHERE id=1", (p_usd,))
         conn.execute("INSERT INTO trade_history (time, symbol, side, entry, exit, pnl_pct, pnl_usd, reason, duration, details) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), sym, pos['type'], pos['entry'], ex_p, round(n_p*100, 2), round(p_usd, 2), reas, round(time.time()-pos['start_time'], 1), json.dumps(pos['details'])))
+                     (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), sym, pos['type'], pos['entry'], ex_p, round(n_p*100, 2), round(p_usd, 2), reas, round(time.time()-pos['start_time'], 1), json.dumps(pos['details'])))
 
     def _calculate_net_pnl(self, pos, curr_p) -> float:
         if curr_p <= 0: return 0.0
@@ -341,7 +458,7 @@ class SharkTrader:
                f"━━━━━━━━━━━━━━━━━━\n"
                f"💵 `Entry: {price:.5f}`\n"
                f"💰 `Wallet: ${self.wallet['balance']:,.2f}`")
-        asyncio.create_task(self.send_telegram(msg))
+        self._spawn_task(self.send_telegram(msg))
 
     def _notify_close(self, symbol, pos, exit_p, net_p, pnl_usd, reason):
         if not self.session or not self.tg_cfg.get('enabled'): return
@@ -365,12 +482,84 @@ class SharkTrader:
                f"💵 `Exit:  {exit_p:.5f}`\n"
                f"━━━━━━━━━━━━━━━━━━\n"
                f"💰 `Final Bal: ${self.wallet['balance']:,.2f}`")
-        asyncio.create_task(self.send_telegram(msg))
+        self._spawn_task(self.send_telegram(msg))
 
     async def send_telegram(self, msg):
         if not self.session or not self.tg_cfg.get('enabled'): return
-        url = f"https://api.telegram.org/bot{self.tg_cfg.get('token')}/sendMessage"
+        token = os.environ.get('SHARK_TG_TOKEN') or self.tg_cfg.get('token')
+        if not token: return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         try: await self.session.post(url, json={'chat_id': self.tg_cfg.get('chat_id'), 'text': msg, 'parse_mode': 'Markdown'})
-        except Exception as e: logging.debug(f"TG Send Failed: {e}")
+        except Exception as e: logging.debug(f"TG Send Failed: {type(e).__name__}")
 
     def set_session(self, session): self.session = session
+
+    # ------------------------------------------------------------------
+    #  Live Trading: Balance & Position Sync
+    # ------------------------------------------------------------------
+
+    async def sync_balance(self):
+        """Cross-check local wallet against exchange.  Paper mode is a no-op."""
+        if isinstance(self.executor, PaperExecutor):
+            return
+        exchange_balance = await self.executor.get_balance()
+        if exchange_balance <= 0:
+            return
+        # Hold lock during read+write to prevent race with close_position Phase 6
+        if not await self._acquire_lock("sync_balance"):
+            return
+        try:
+            local_balance = self.wallet['balance']
+            drift = abs(exchange_balance - local_balance)
+            if drift > max(1.0, local_balance * 0.01):
+                logging.warning(
+                    f"[Sync] Balance drift: exchange=${exchange_balance:.2f} "
+                    f"local=${local_balance:.2f} (delta=${drift:.2f})"
+                )
+                self.wallet['balance'] = exchange_balance
+                await self._execute_db_task(self._db_set_balance, exchange_balance)
+        finally:
+            self.lock.release()
+
+    def _db_set_balance(self, conn, balance):
+        conn.execute("UPDATE wallet SET balance=?, last_update=datetime('now') WHERE id=1", (balance,))
+
+    async def reconcile_positions(self):
+        """Sync local positions with exchange.  Paper mode is a no-op."""
+        if isinstance(self.executor, PaperExecutor):
+            return
+
+        exchange_pos = await self.executor.get_positions()
+
+        if not await self._acquire_lock("reconcile_positions"):
+            return
+        try:
+            local_syms = set(self.positions.keys())
+            exchange_syms = set(exchange_pos.keys())
+
+            # Case 1: On exchange but not local (manual trade or restart)
+            for sym in exchange_syms - local_syms:
+                ep = exchange_pos[sym]
+                logging.warning(f"[Reconcile] Untracked position found: {sym}. Registering locally.")
+                self.positions[sym] = {
+                    'entry': ep['entry'], 'type': ep['type'], 'qty': ep['qty'],
+                    'entry_margin': ep['entry'] * ep['qty'] / ep['leverage'],
+                    'lev': ep['leverage'], 'start_time': time.time(),
+                    'details': {'mode': 'RECOVERED', 'max_price': ep['entry']},
+                }
+                await self._execute_db_task(
+                    self._db_add_pos, sym, ep['entry'], ep['type'], ep['qty'],
+                    ep['entry'] * ep['qty'] / ep['leverage'], ep['leverage'],
+                    self.positions[sym]['details'],
+                )
+
+            # Case 2: Local but not on exchange (manually closed or liquidated)
+            for sym in local_syms - exchange_syms:
+                logging.warning(f"[Reconcile] Ghost position removed: {sym}")
+                del self.positions[sym]
+                await self._execute_db_task(self._db_remove_pos, sym)
+        finally:
+            self.lock.release()
+
+    def _db_remove_pos(self, conn, sym):
+        conn.execute("DELETE FROM active_positions WHERE symbol=?", (sym,))
